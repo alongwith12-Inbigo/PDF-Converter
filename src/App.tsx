@@ -72,6 +72,7 @@ export default function App() {
   // Renaming Batch State
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameProgress, setRenameProgress] = useState<{ current: number; total: number; fileName: string } | null>(null);
+  const [renameOnDownload, setRenameOnDownload] = useState(true);
 
   // Find candidates for renaming: files whose names contain a 5-digit student number but are not already renamed to exactly that number
   const renameCandidates = useMemo(() => {
@@ -401,10 +402,16 @@ export default function App() {
               t.id === task.id ? { ...t, status: "completed", progressText: "변환 완료! 저장할 수 있습니다.", pdfUrl } : t
             ));
             
-            const cleanName = fileName.replace(/\.[a-zA-Z0-9]+$/, "");
+            let downloadName = fileName.replace(/\.[a-zA-Z0-9]+$/, "");
+            if (renameOnDownload) {
+              const match = fileName.match(/(?<!\d)(\d{5})(?!\d)/);
+              if (match) {
+                downloadName = match[1];
+              }
+            }
             const link = document.createElement("a");
             link.href = pdfUrl;
-            link.download = `${cleanName}.pdf`;
+            link.download = `${downloadName}.pdf`;
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
@@ -457,10 +464,16 @@ export default function App() {
                 t.id === task.id ? { ...t, status: "completed", progressText: "변환 완료! 저장할 수 있습니다.", pdfUrl } : t
               ));
               
-              const cleanName = fileName.replace(/\.[a-zA-Z0-9]+$/, "");
+              let downloadName = fileName.replace(/\.[a-zA-Z0-9]+$/, "");
+              if (renameOnDownload) {
+                const match = fileName.match(/(?<!\d)(\d{5})(?!\d)/);
+                if (match) {
+                  downloadName = match[1];
+                }
+              }
               const link = document.createElement("a");
               link.href = pdfUrl;
-              link.download = `${cleanName}.pdf`;
+              link.download = `${downloadName}.pdf`;
               document.body.appendChild(link);
               link.click();
               document.body.removeChild(link);
@@ -626,10 +639,16 @@ export default function App() {
         updateTaskStatus("completed", "변환 완료! 저장할 수 있습니다.", undefined, pdfUrl);
 
         // Auto trigger download
-        const cleanName = task.name.replace(/\.[a-zA-Z0-9]+$/, "");
+        let downloadName = task.name.replace(/\.[a-zA-Z0-9]+$/, "");
+        if (renameOnDownload) {
+          const match = task.name.match(/(?<!\d)(\d{5})(?!\d)/);
+          if (match) {
+            downloadName = match[1];
+          }
+        }
         const link = document.createElement("a");
         link.href = pdfUrl;
-        link.download = `${cleanName}.pdf`;
+        link.download = `${downloadName}.pdf`;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
@@ -1235,6 +1254,24 @@ export default function App() {
                   구글 드라이브 내에서 변환 대상 문서들을 체크한 뒤 아래 변환 버튼을 실행하면 다운로드가 즉시 생성됩니다. 한글 파일(.hwp) 형식도 완전 호환 처리됩니다.
                 </p>
 
+                <div className="flex items-start gap-2.5 p-3 bg-indigo-50/50 border border-indigo-100 rounded-xl">
+                  <input
+                    type="checkbox"
+                    id="rename-on-download-cb"
+                    checked={renameOnDownload}
+                    onChange={(e) => setRenameOnDownload(e.target.checked)}
+                    className="rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500 w-4 h-4 cursor-pointer mt-0.5 shrink-0"
+                  />
+                  <div className="text-left">
+                    <label htmlFor="rename-on-download-cb" className="text-xs font-bold text-slate-800 cursor-pointer select-none">
+                      PDF 다운로드 시 학번만 추출하여 저장
+                    </label>
+                    <p className="text-[10px] text-slate-500 leading-normal mt-0.5">
+                      파일명에 5자리 학번이 감지되면 다운로드 파일명을 해당 학번(예: 10101.pdf)으로 자동 지정합니다. (드라이브 원본 파일명 보존)
+                    </p>
+                  </div>
+                </div>
+
                 {selectedFileIds.size === 0 ? (
                   <div className="bg-slate-50 rounded-xl p-5 text-center border border-slate-100 flex flex-col items-center justify-center min-h-[140px]">
                     <FileText className="w-8 h-8 text-slate-350 stroke-[1.5] mb-2 animate-bounce" />
@@ -1346,7 +1383,16 @@ export default function App() {
                           {task.pdfUrl && (
                             <a 
                               href={task.pdfUrl} 
-                              download={`${task.name.replace(/\.[a-zA-Z0-9]+$/, "")}.pdf`}
+                              download={(() => {
+                                let downloadName = task.name.replace(/\.[a-zA-Z0-9]+$/, "");
+                                if (renameOnDownload) {
+                                  const match = task.name.match(/(?<!\d)(\d{5})(?!\d)/);
+                                  if (match) {
+                                    downloadName = match[1];
+                                  }
+                                }
+                                return `${downloadName}.pdf`;
+                              })()}
                               className="text-indigo-600 hover:underline font-semibold flex items-center gap-1"
                             >
                               <Download className="w-3 h-3" /> 개별 재다운로드
