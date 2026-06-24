@@ -164,9 +164,19 @@ export default function App() {
     } catch (err: any) {
       console.error("파일 로딩 에러:", err);
       // If unauthorized, token might be expired. Force relogin or reset.
-      if (err.message?.includes("401") || err.message?.includes("Invalid credentials")) {
-        setToken(null);
-        setUser(null);
+      const errMsg = String(err.message || "").toLowerCase();
+      if (
+        errMsg.includes("401") ||
+        errMsg.includes("403") ||
+        errMsg.includes("credential") ||
+        errMsg.includes("credentials") ||
+        errMsg.includes("unauthorized") ||
+        errMsg.includes("invalid") ||
+        errMsg.includes("auth") ||
+        errMsg.includes("token")
+      ) {
+        handleLogout();
+        alert("구글 연동 위임 권한 세션이 만료되었거나 로그인 값이 올바르지 않습니다. 안전한 정밀 조작을 위해 로그인을 진행하시기 바랍니다.");
       }
     } finally {
       setIsLoadingFiles(false);
@@ -521,7 +531,22 @@ export default function App() {
 
       } catch (err: any) {
         console.error(`변환 실패 (${task.name}):`, err);
-        updateTaskStatus("failed", "변환 오류 발생", err.message || "알 수 없는 에러가 발생했습니다.");
+        const errMsg = String(err.message || "").toLowerCase();
+        if (
+          errMsg.includes("401") ||
+          errMsg.includes("403") ||
+          errMsg.includes("credential") ||
+          errMsg.includes("credentials") ||
+          errMsg.includes("unauthorized") ||
+          errMsg.includes("invalid") ||
+          errMsg.includes("auth") ||
+          errMsg.includes("token")
+        ) {
+          handleLogout();
+          alert("구글 연동 위임 권한 세션이 만료되었거나 로그인 값이 올바르지 않습니다. 안전한 정밀 조작을 위해 로그인을 진행하시기 바랍니다.");
+        } else {
+          updateTaskStatus("failed", "변환 오류 발생", err.message || "알 수 없는 에러가 발생했습니다.");
+        }
       }
     }
 
