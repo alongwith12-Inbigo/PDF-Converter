@@ -31,6 +31,7 @@ import {
   exportGoogleDocToPdf,
   uploadAndConvertToGoogleDoc,
   deleteDriveFile,
+  renameDriveFile,
   DriveFile,
   setAccessToken
 } from "./lib/drive";
@@ -67,6 +68,26 @@ export default function App() {
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
   const [conversionQueue, setConversionQueue] = useState<ConversionTask[]>([]);
   const [isConverting, setIsConverting] = useState(false);
+
+  // Renaming Batch State
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [renameProgress, setRenameProgress] = useState<{ current: number; total: number; fileName: string } | null>(null);
+
+  // Find candidates for renaming: files whose names contain a 5-digit student number but are not already renamed to exactly that number
+  const renameCandidates = useMemo(() => {
+    return files.filter(file => {
+      if (file.mimeType === "application/vnd.google-apps.folder") return false;
+      
+      const match = file.name.match(/(?<!\d)(\d{5})(?!\d)/);
+      if (!match) return false;
+      
+      const studentNum = match[1];
+      const dotIndex = file.name.lastIndexOf(".");
+      const nameWithoutExt = dotIndex !== -1 ? file.name.substring(0, dotIndex) : file.name;
+      
+      return nameWithoutExt.trim() !== studentNum;
+    });
+  }, [files]);
 
   // Link Paste & Parsing State
   const [pastedUrl, setPastedUrl] = useState("");
@@ -206,6 +227,90 @@ export default function App() {
     setFiles([]);
     setSelectedFileIds(new Set());
     setConversionQueue([]);
+  };
+
+  const handleBatchRename = async () => {
+    if (renameCandidates.length === 0 || !token) return;
+    
+    const confirmRename = window.confirm(
+      `감지된 ${renameCandidates.length}개 파일의 이름을 각각 파일명에 포함된 5자리 학번(예: 10101)으로 변경하시겠습니까?\n이 작업은 구글 드라이브의 실제 파일명을 영구 수정합니다.`
+    );
+    if (!confirmRename) return;
+
+    setIsRenaming(true);
+    
+    let successCount = 0;
+    let failCount = 0;
+    
+    for (let i = 0; i < renameCandidates.length; i++) {
+      const file = renameCandidates[i];
+      const match = file.name.match(/(?<!\d)(\d{5})(?!\d)/);
+      if (!match) continue;
+      
+      const studentNum = match[1];
+      const dotIndex = file.name.lastIndexOf(".");
+      const ext = dotIndex !== -1 ? file.name.substring(dotIndex) : "";
+      const newName = `${studentNum}${ext}`;
+      
+      setRenameProgress({
+        current: i + 1,
+        total: renameCandidates.length,
+        fileName: file.name
+      });
+      
+      try {
+        await renameDriveFile(token, file.id, newName);
+        successCount++;
+      } catch (err) {
+        console.error(`Failed to rename ${file.name}:`, err);
+        failCount++;
+      }
+    }
+    
+    setIsRenaming(false);
+    setRenameProgress(null);
+    
+    alert(`정리가 완료되었습니다!\n성공: ${successCount}개${failCount > 0 ? `, 실패: ${failCount}개` : ""}`);
+    
+    // Refresh the file list
+    loadFiles(currentFolderId);
+  };
+
+  const handleSingleRename = async (file: DriveFile) => {
+    if (!token) return;
+    
+    const match = file.name.match(/(?<!\d)(\d{5})(?!\d)/);
+    if (!match) return;
+    
+    const studentNum = match[1];
+    const dotIndex = file.name.lastIndexOf(".");
+    const ext = dotIndex !== -1 ? file.name.substring(dotIndex) : "";
+    const newName = `${studentNum}${ext}`;
+
+    const confirmResult = window.confirm(
+      `이 파일의 이름을 포함된 학번인 '${newName}'(으)로 변경하시겠습니까?\n\n이 폴더 전체의 학번 파일들을 일괄 정리하고 싶으시다면, 상단의 '학번명 일괄 정리 도우미' 배너를 사용해 주십시오.`
+    );
+    
+    if (!confirmResult) return;
+
+    setIsRenaming(true);
+    setRenameProgress({
+      current: 1,
+      total: 1,
+      fileName: file.name
+    });
+
+    try {
+      await renameDriveFile(token, file.id, newName);
+      alert(`성공적으로 파일명을 '${newName}'(으)로 변경했습니다.`);
+    } catch (err: any) {
+      console.error(`Failed to rename file:`, err);
+      alert(`파일명 변경 실패: ${err.message || "알 수 없는 에러"}`);
+    } finally {
+      setIsRenaming(false);
+      setRenameProgress(null);
+      loadFiles(currentFolderId);
+    }
   };
 
   // Process pasted Google Drive URLs
@@ -962,6 +1067,32 @@ export default function App() {
 
               {/* Files Table / List */}
               <div className="flex-1 overflow-y-auto max-h-[500px]">
+                {/* Batch Rename Helper Banner */}
+                {renameCandidates.length > 0 && !isLoadingFiles && (
+                  <div className="mx-4 my-3 p-3.5 bg-indigo-50/70 border border-indigo-100 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-inner">
+                    <div className="flex items-start gap-2.5 text-left">
+                      <div className="p-1.5 bg-indigo-100 rounded-lg text-indigo-700 shrink-0 mt-0.5 sm:mt-0">
+                        <Settings className="w-4 h-4 animate-spin" style={{ animationDuration: '10s' }} />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <span>학번명 일괄 정리 도우미</span>
+                          <span className="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-bold">감지 {renameCandidates.length}개</span>
+                        </h4>
+                        <p className="text-[11px] text-slate-500 mt-0.5 leading-normal">
+                          파일명에 5자리 학번(예: 10101)이 포함되었지만 아직 학번만으로 정리되지 않은 파일이 발견되었습니다. 파일명을 학번으로만 깔끔하게 일괄 변경하시겠습니까?
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleBatchRename}
+                      className="shrink-0 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white text-xs font-bold rounded-lg transition-all shadow-sm"
+                    >
+                      예, 일괄 변경하기
+                    </button>
+                  </div>
+                )}
+
                 {isLoadingFiles ? (
                   <div className="flex flex-col items-center justify-center p-20 space-y-3">
                     <Loader2 className="w-8 h-8 animate-spin text-indigo-500" />
@@ -1039,10 +1170,17 @@ export default function App() {
                             <div className="shrink-0 p-1.5 bg-slate-100 rounded-lg">
                               {getFileIcon(file)}
                             </div>
-                            <div className="text-left">
-                              <p className="text-sm font-semibold text-slate-800 line-clamp-1">
-                                {file.name}
-                              </p>
+                            <div className="text-left flex-1 min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <p className="text-sm font-semibold text-slate-800 line-clamp-1">
+                                  {file.name}
+                                </p>
+                                {renameCandidates.some(c => c.id === file.id) && (
+                                  <span className="shrink-0 bg-amber-50 text-amber-700 border border-amber-200/50 text-[9px] px-1.5 py-0.5 rounded font-bold">
+                                    학번감지
+                                  </span>
+                                )}
+                              </div>
                               <div className="flex items-center gap-2 mt-1">
                                 {getFormatBadge(file.mimeType, file.name)}
                                 {file.createdTime && (
@@ -1054,8 +1192,20 @@ export default function App() {
                             </div>
                           </div>
 
-                          <div className="w-24 text-right text-xs text-slate-500 hidden sm:block">
-                            {isFolder ? "디렉토리" : formatBytes(file.size)}
+                          <div className="w-28 text-right text-xs text-slate-500 hidden sm:flex items-center justify-end gap-1.5 shrink-0">
+                            <span>{isFolder ? "디렉토리" : formatBytes(file.size)}</span>
+                            {renameCandidates.some(c => c.id === file.id) && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSingleRename(file);
+                                }}
+                                className="ml-1 px-1.5 py-0.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-150 text-indigo-700 text-[10px] font-bold rounded-md transition-colors shrink-0 cursor-pointer"
+                                title="포함된 5자리 학번으로 파일명 정리"
+                              >
+                                학번정리
+                              </button>
+                            )}
                           </div>
                         </div>
                       );
@@ -1265,6 +1415,42 @@ export default function App() {
                 >
                   확인 후 닫기
                 </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* BATCH RENAMING PROGRESS MODAL */}
+      <AnimatePresence>
+        {isRenaming && renameProgress && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-100 text-center space-y-4"
+            >
+              <Loader2 className="w-10 h-10 animate-spin text-indigo-650 mx-auto" />
+              <div className="space-y-1">
+                <h3 className="font-bold text-slate-900 text-sm">학번 파일명 일괄 변경 중...</h3>
+                <p className="text-xs text-slate-500">Google Drive API를 통해 안전하게 파일명을 변경하고 있습니다.</p>
+              </div>
+              <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 text-left">
+                <p className="text-[9px] text-slate-400 uppercase font-bold tracking-wider">처리 대상</p>
+                <p className="text-xs font-semibold text-slate-700 truncate mt-0.5">{renameProgress.fileName}</p>
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-[11px] font-bold text-slate-500">
+                  <span>진행도</span>
+                  <span>{renameProgress.current} / {renameProgress.total}개 ({Math.round((renameProgress.current / renameProgress.total) * 100)}%)</span>
+                </div>
+                <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+                  <div 
+                    className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${(renameProgress.current / renameProgress.total) * 100}%` }}
+                  ></div>
+                </div>
               </div>
             </motion.div>
           </div>

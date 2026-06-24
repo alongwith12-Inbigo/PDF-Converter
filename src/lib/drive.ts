@@ -8,8 +8,7 @@ export const auth = getAuth(app);
 
 // Use Google Auth Provider
 export const provider = new GoogleAuthProvider();
-provider.addScope("https://www.googleapis.com/auth/drive.readonly");
-provider.addScope("https://www.googleapis.com/auth/drive.file");
+provider.addScope("https://www.googleapis.com/auth/drive");
 
 let isSigningIn = false;
 let cachedAccessToken: string | null = typeof window !== "undefined" ? localStorage.getItem("gdrive_access_token") : null;
@@ -236,4 +235,22 @@ export const deleteDriveFile = async (accessToken: string, fileId: string): Prom
       Authorization: `Bearer ${accessToken}`,
     },
   });
+};
+
+// Rename a file
+export const renameDriveFile = async (accessToken: string, fileId: string, newName: string): Promise<void> => {
+  const url = `https://www.googleapis.com/drive/v3/files/${fileId}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ name: newName }),
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error?.message || `파일 이름 변경에 실패했습니다: ${res.status}`);
+  }
 };
