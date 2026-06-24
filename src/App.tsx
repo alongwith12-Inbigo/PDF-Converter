@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { 
   Folder, 
   FileText, 
@@ -18,7 +18,8 @@ import {
   Clock,
   Settings,
   HelpCircle,
-  FileDown
+  FileDown,
+  Upload
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
@@ -46,6 +47,7 @@ interface ConversionTask {
   progressText: string;
   error?: string;
   pdfUrl?: string;
+  localFile?: File;
 }
 
 export default function App() {
@@ -73,6 +75,8 @@ export default function App() {
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameProgress, setRenameProgress] = useState<{ current: number; total: number; fileName: string } | null>(null);
   const [renameOnDownload, setRenameOnDownload] = useState(true);
+  const [downloadAsZip, setDownloadAsZip] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
 
   // Find candidates for renaming: files whose names contain a 5-digit student number but are not already renamed to exactly that number
   const renameCandidates = useMemo(() => {
@@ -566,24 +570,14 @@ export default function App() {
     setSelectedFileIds(newSelection);
   };
 
-  // Convert files in selected list to PDF
-  const startPdfConversion = async () => {
-    if (selectedFileIds.size === 0 || !token) return;
+  // Core conversion execution pipeline (handles both Google Drive files and local uploaded files)
+  const runConversion = async (tasks: ConversionTask[], overrideToken?: string) => {
+    const activeToken = overrideToken || token;
+    if (!activeToken) return;
 
-    // Create tasks
-    const filesToConvert = files.filter(f => selectedFileIds.has(f.id));
-    const tasks: ConversionTask[] = filesToConvert.map(f => ({
-      id: f.id,
-      name: f.name,
-      mimeType: f.mimeType,
-      status: "idle",
-      progressText: "대기 중...",
-    }));
-
-    setConversionQueue(tasks);
     setIsConverting(true);
+    const successfulPdfs: { name: string; blob: Blob }[] = [];
 
-    // Process tasks sequentially to prevent parallel API rate limits
     for (let i = 0; i < tasks.length; i++) {
       const task = tasks[i];
       
@@ -599,46 +593,58 @@ export default function App() {
       };
 
       try {
-        const isGoogleDoc = 
-          task.mimeType.startsWith("application/vnd.google-apps.document") || 
-          task.mimeType.startsWith("application/vnd.google-apps.spreadsheet") ||
-          task.mimeType.startsWith("application/vnd.google-apps.presentation");
-
         let pdfBlob: Blob;
 
-        if (isGoogleDoc) {
-          // Direct Google Docs Export
-          updateTaskStatus("exporting", "Google 드라이브에서 직접 PDF로 내보내는 중...");
-          pdfBlob = await exportGoogleDocToPdf(token, task.id);
-        } else {
-          // HWP, DOCX or other third-party file conversion:
-          // 1. Download HWP file binary from Google Drive
-          updateTaskStatus("downloading", "드라이브에서 오리지널 파일 다운로드 중...");
-          const originalBlob = await downloadDriveFileBlob(token, task.id);
-
-          // 2. Upload file specifying autoconversion to Google Docs
-          updateTaskStatus("uploading", "임시 구글 문서로 업로드 및 자동 파싱 변환 중...");
-          const tempDocId = await uploadAndConvertToGoogleDoc(token, task.name, originalBlob);
+        if (task.localFile) {
+          // Local File Conversion Flow:
+          updateTaskStatus("uploading", "임시 구글 가상 변환기로 업로드 중...");
+          const tempDocId = await uploadAndConvertToGoogleDoc(activeToken, task.name, task.localFile);
 
           try {
-            // 3. Export this Google Doc into PDF
-            updateTaskStatus("exporting", "생성된 구글 문서 템플릿에서 고화질 PDF 렌더링 중...");
-            pdfBlob = await exportGoogleDocToPdf(token, tempDocId);
+            updateTaskStatus("exporting", "고화질 PDF로 문서 포맷 렌더링 중...");
+            pdfBlob = await exportGoogleDocToPdf(activeToken, tempDocId);
           } finally {
-            // 4. Remove temporary doc file from user Drive
+            // Cleanup from user's Drive right away
             try {
-              await deleteDriveFile(token, tempDocId);
+              await deleteDriveFile(activeToken, tempDocId);
             } catch (e) {
-              console.warn("임시 변환 파일 삭제 실패:", e);
+              console.warn("임시 파일 정리 실패:", e);
+            }
+          }
+        } else {
+          // Google Drive File Conversion Flow:
+          const isGoogleDoc = 
+            task.mimeType.startsWith("application/vnd.google-apps.document") || 
+            task.mimeType.startsWith("application/vnd.google-apps.spreadsheet") ||
+            task.mimeType.startsWith("application/vnd.google-apps.presentation");
+
+          if (isGoogleDoc) {
+            updateTaskStatus("exporting", "Google 드라이브에서 직접 PDF 내보내는 중...");
+            pdfBlob = await exportGoogleDocToPdf(activeToken, task.id);
+          } else {
+            updateTaskStatus("downloading", "드라이브에서 원본 이진 데이터 다운로드 중...");
+            const originalBlob = await downloadDriveFileBlob(activeToken, task.id);
+
+            updateTaskStatus("uploading", "임시 구글 변환 버퍼로 업로드 중...");
+            const tempDocId = await uploadAndConvertToGoogleDoc(activeToken, task.name, originalBlob);
+
+            try {
+              updateTaskStatus("exporting", "PDF 렌더링 파이프라인 가동 중...");
+              pdfBlob = await exportGoogleDocToPdf(activeToken, tempDocId);
+            } finally {
+              try {
+                await deleteDriveFile(activeToken, tempDocId);
+              } catch (e) {
+                console.warn("임시 변환 파일 정리 실패:", e);
+              }
             }
           }
         }
 
-        // Create browser download URL
+        // Generate locally accessible URL
         const pdfUrl = URL.createObjectURL(pdfBlob);
         updateTaskStatus("completed", "변환 완료! 저장할 수 있습니다.", undefined, pdfUrl);
 
-        // Auto trigger download
         let downloadName = task.name.replace(/\.[a-zA-Z0-9]+$/, "");
         if (renameOnDownload) {
           const match = task.name.match(/(?<!\d)(\d{5})(?!\d)/);
@@ -646,12 +652,18 @@ export default function App() {
             downloadName = match[1];
           }
         }
-        const link = document.createElement("a");
-        link.href = pdfUrl;
-        link.download = `${downloadName}.pdf`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
+
+        successfulPdfs.push({ name: `${downloadName}.pdf`, blob: pdfBlob });
+
+        // Auto trigger download only if NOT downloading as a single ZIP
+        if (!downloadAsZip) {
+          const link = document.createElement("a");
+          link.href = pdfUrl;
+          link.download = `${downloadName}.pdf`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
 
       } catch (err: any) {
         console.error(`변환 실패 (${task.name}):`, err);
@@ -667,14 +679,130 @@ export default function App() {
           errMsg.includes("token")
         ) {
           handleLogout();
-          alert("구글 연동 위임 권한 세션이 만료되었거나 로그인 값이 올바르지 않습니다. 안전한 정밀 조작을 위해 로그인을 진행하시기 바랍니다.");
+          alert("구글 연동 위임 권한 세션이 만료되었습니다. 안전한 기동을 위해 재로그인을 완료하시기 바랍니다.");
+          setIsConverting(false);
+          return;
         } else {
           updateTaskStatus("failed", "변환 오류 발생", err.message || "알 수 없는 에러가 발생했습니다.");
         }
       }
     }
 
+    // Zip conversion results together if option selected and successful PDFs are present
+    if (downloadAsZip && successfulPdfs.length > 0) {
+      try {
+        const JSZip = (await import("jszip")).default;
+        const zip = new JSZip();
+
+        successfulPdfs.forEach(file => {
+          zip.file(file.name, file.blob);
+        });
+
+        const zipBlob = await zip.generateAsync({ type: "blob" });
+        const zipUrl = URL.createObjectURL(zipBlob);
+
+        const link = document.createElement("a");
+        link.href = zipUrl;
+        const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        link.download = `pdf_package_${dateStr}.zip`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } catch (zipErr) {
+        console.error("ZIP 파일 제작 실패:", zipErr);
+        alert("ZIP 압축 생성 도중 에러가 발생했습니다. 하단 개별 변환 완료창에서 각 파일을 재다운로드해 주십시오.");
+      }
+    }
+
     setIsConverting(false);
+  };
+
+  // Convert files in selected list to PDF
+  const startPdfConversion = async () => {
+    if (selectedFileIds.size === 0 || !token) return;
+
+    const filesToConvert = files.filter(f => selectedFileIds.has(f.id));
+    const tasks: ConversionTask[] = filesToConvert.map(f => ({
+      id: f.id,
+      name: f.name,
+      mimeType: f.mimeType,
+      status: "idle",
+      progressText: "대기 중...",
+    }));
+
+    setConversionQueue(tasks);
+    await runConversion(tasks);
+  };
+
+  // Handle local file uploads conversion
+  const handleLocalFilesUpload = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+
+    // Check Google Login first
+    if (!token) {
+      const confirmLogin = window.confirm(
+        "로컬 파일 직접 업로드 변환 기능은 실시간 임시 구글 Docs 가상 변환기를 가동하므로, 최초 1회의 안전한 Google 계정 연결 위임 처리가 필요합니다.\n\n구글 계정 연결을 가동하시겠습니까?"
+      );
+      if (confirmLogin) {
+        try {
+          setIsLoggingIn(true);
+          const result = await googleSignIn();
+          if (result) {
+            setToken(result.accessToken);
+            setUser(result.user);
+            setAccessToken(result.accessToken);
+            
+            // Build tasks and run using newly obtained token
+            const tasks: ConversionTask[] = Array.from(fileList).map((file, idx) => ({
+              id: `local-${Date.now()}-${idx}-${Math.random()}`,
+              name: file.name,
+              mimeType: file.type || "application/octet-stream",
+              status: "idle",
+              progressText: "대기 중...",
+              localFile: file,
+            }));
+            setConversionQueue(tasks);
+            await runConversion(tasks, result.accessToken);
+          }
+        } catch (err: any) {
+          alert("구글 계정 연동 실패: " + (err.message || "로그인 불가"));
+        } finally {
+          setIsLoggingIn(false);
+        }
+      }
+      return;
+    }
+
+    // Already signed in
+    const tasks: ConversionTask[] = Array.from(fileList).map((file, idx) => ({
+      id: `local-${Date.now()}-${idx}-${Math.random()}`,
+      name: file.name,
+      mimeType: file.type || "application/octet-stream",
+      status: "idle",
+      progressText: "대기 중...",
+      localFile: file,
+    }));
+    setConversionQueue(tasks);
+    await runConversion(tasks);
+  };
+
+  // Drag and Drop Handlers for local uploads
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleLocalFilesUpload(e.dataTransfer.files);
+    }
   };
 
   // Render original file format badge
@@ -925,48 +1053,107 @@ export default function App() {
 
         {/* IF NOT LOGGED IN & NO TOKEN */}
         {!user || !token ? (
-          <div className="col-span-12 flex flex-col items-center justify-center py-10 px-4">
-            <motion.div 
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.5 }}
-              className="max-w-md w-full bg-white border border-slate-200/80 rounded-3xl p-8 shadow-xl text-center"
-            >
-              <div className="relative inline-block mb-6">
-                <div className="absolute inset-0 bg-indigo-100 rounded-3xl blur-md scale-110"></div>
-                <div className="relative bg-gradient-to-tr from-indigo-500 to-blue-600 text-white p-5 rounded-2xl shadow-lg">
-                  <FileDown className="w-10 h-10" />
+          <div className="col-span-12 flex flex-col items-center justify-center py-6 px-4">
+            <div className="w-full max-w-5xl grid grid-cols-1 md:grid-cols-2 gap-8 items-stretch">
+              
+              {/* Left Column: Google Login */}
+              <motion.div 
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ duration: 0.5 }}
+                className="bg-white border border-slate-200/80 rounded-3xl p-8 shadow-xl text-center flex flex-col justify-between"
+              >
+                <div>
+                  <div className="relative inline-block mb-6">
+                    <div className="absolute inset-0 bg-indigo-100 rounded-3xl blur-md scale-110"></div>
+                    <div className="relative bg-gradient-to-tr from-indigo-500 to-blue-600 text-white p-5 rounded-2xl shadow-lg">
+                      <FileDown className="w-10 h-10" />
+                    </div>
+                  </div>
+                  <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">구글 드라이브 원격 탐색기 기동</h2>
+                  <p className="text-slate-500 text-xs mt-3 leading-relaxed max-w-sm mx-auto">
+                    안전한 원격 공유 폴더 탐색과 한글(.hwp) 변환 파이프라인 원클릭 가동, 다중 파일 일괄 렌더링을 시작하시려면 신속한 Google 계정 연결을 실행하십시오.
+                  </p>
                 </div>
-              </div>
-              <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">또는 내 드라이브 연동하여 정밀 편집하기</h2>
-              <p className="text-slate-500 text-sm mt-3 leading-relaxed max-w-sm mx-auto">
-                안전한 전체 드라이브 탐색과 한글(.hwp) 변환 파이프라인 관리, 다중 파일 일괄 렌더링을 맛보시려면 빠른 구글 계정 연결을 실행하십시오.
-              </p>
 
-              <div className="mt-8 space-y-4">
-                <button
-                  onClick={handleLogin}
-                  disabled={isLoggingIn}
-                  className="w-full flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3.5 px-6 rounded-2xl shadow-lg shadow-indigo-600/20 active:scale-[0.98] transition-all disabled:opacity-75 disabled:cursor-not-allowed"
-                >
-                  {isLoggingIn ? (
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                  ) : (
-                    <svg className="w-5 h-5" viewBox="0 0 48 48">
-                      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
-                      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
-                      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
-                      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
-                    </svg>
-                  )}
-                  <span className="font-semibold text-sm">구글 계정 연결하고 탐색기 기동</span>
-                </button>
-              </div>
+                <div className="mt-8 space-y-4">
+                  <button
+                    onClick={handleLogin}
+                    disabled={isLoggingIn}
+                    className="w-full flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3.5 px-6 rounded-2xl shadow-lg shadow-indigo-600/20 active:scale-[0.98] transition-all disabled:opacity-75 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    {isLoggingIn ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <svg className="w-5 h-5" viewBox="0 0 48 48">
+                        <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+                        <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+                        <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
+                        <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+                      </svg>
+                    )}
+                    <span className="font-semibold text-sm">구글 계정 연결하고 탐색기 기동</span>
+                  </button>
 
-              <div className="mt-6 text-[11px] text-slate-450">
-                본 클라이언트 변환 엔진은 어떠한 사용자 암호 토큰도 보존하지 않으며 브라우저 메모리 세션 파기 시 자동 영구 폐기됩니다.
-              </div>
-            </motion.div>
+                  <div className="text-[11px] text-slate-450 text-center">
+                    본 클라이언트 변환 엔진은 어떠한 사용자 암호 토큰도 수집하지 않으며 메모리 파기 시 자동 영구 폐기됩니다.
+                  </div>
+                </div>
+              </motion.div>
+
+              {/* Right Column: Local Drag & Drop Upload */}
+              <motion.div 
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ duration: 0.5 }}
+                className={`bg-white border rounded-3xl p-8 shadow-xl text-center flex flex-col justify-between transition-all duration-300 ${
+                  isDragOver 
+                    ? "border-indigo-500 bg-indigo-50/20 ring-4 ring-indigo-500/10 scale-[1.01]" 
+                    : "border-slate-200/80 hover:border-slate-300"
+                }`}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+              >
+                <div>
+                  <div className="relative inline-block mb-6">
+                    <div className="absolute inset-0 bg-blue-100 rounded-3xl blur-md scale-110"></div>
+                    <div className="relative bg-gradient-to-tr from-blue-500 to-indigo-600 text-white p-5 rounded-2xl shadow-lg">
+                      <Upload className="w-10 h-10" />
+                    </div>
+                  </div>
+                  <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">내 PC 파일 직접 드롭 및 자동 변환</h2>
+                  <p className="text-slate-500 text-xs mt-3 leading-relaxed max-w-sm mx-auto">
+                    가지고 계신 한글(.hwp), 워드(.docx) 파일을 아래 전용 드롭존에 즉시 투하하거나 클릭하여 실시간 변환 다운로드를 개시하십시오.
+                  </p>
+                </div>
+
+                <div className="mt-6 space-y-4">
+                  <div 
+                    className={`border-2 border-dashed rounded-2xl p-8 text-center flex flex-col items-center justify-center cursor-pointer transition-colors ${
+                      isDragOver 
+                        ? "border-indigo-400 bg-indigo-50/30" 
+                        : "border-slate-200 hover:border-indigo-400 bg-slate-50/40 hover:bg-indigo-50/5"
+                    }`}
+                    onClick={() => document.getElementById("local-file-picker-unauth")?.click()}
+                  >
+                    <Upload className={`w-10 h-10 mb-2 transition-transform ${isDragOver ? "text-indigo-600 scale-110 animate-bounce" : "text-slate-400"}`} />
+                    <p className="text-xs font-bold text-slate-700">마우스로 로컬 파일을 끌어놓거나 클릭하세요</p>
+                    <p className="text-[10px] text-slate-450 mt-1">HWP, DOCX, DOC, XLS, PPT, TXT, PDF 등 지원</p>
+                    <p className="text-[10px] text-indigo-500 font-bold mt-2">※ 파일 변환을 위한 1회성 간편 구글 로그인이 자동 연계됩니다.</p>
+                    
+                    <input 
+                      type="file" 
+                      id="local-file-picker-unauth"
+                      multiple
+                      className="hidden" 
+                      onChange={(e) => handleLocalFilesUpload(e.target.files)}
+                    />
+                  </div>
+                </div>
+              </motion.div>
+
+            </div>
           </div>
         ) : (
           <>
@@ -1272,6 +1459,24 @@ export default function App() {
                   </div>
                 </div>
 
+                <div className="flex items-start gap-2.5 p-3 bg-blue-50/50 border border-blue-100 rounded-xl">
+                  <input
+                    type="checkbox"
+                    id="download-as-zip-cb"
+                    checked={downloadAsZip}
+                    onChange={(e) => setDownloadAsZip(e.target.checked)}
+                    className="rounded border-blue-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer mt-0.5 shrink-0"
+                  />
+                  <div className="text-left">
+                    <label htmlFor="download-as-zip-cb" className="text-xs font-bold text-slate-800 cursor-pointer select-none">
+                      일괄 다운로드 시 하나의 ZIP 압축파일로 받기
+                    </label>
+                    <p className="text-[10px] text-slate-500 leading-normal mt-0.5">
+                      여러 파일을 일괄 변환할 때, 개별 다운로드하지 않고 하나의 .zip 패키지 파일로 묶어서 다운로드합니다. (기본: 개별 다운로드)
+                    </p>
+                  </div>
+                </div>
+
                 {selectedFileIds.size === 0 ? (
                   <div className="bg-slate-50 rounded-xl p-5 text-center border border-slate-100 flex flex-col items-center justify-center min-h-[140px]">
                     <FileText className="w-8 h-8 text-slate-350 stroke-[1.5] mb-2 animate-bounce" />
@@ -1308,6 +1513,47 @@ export default function App() {
                     </button>
                   </div>
                 )}
+              </div>
+
+              {/* Local File Direct Upload Card */}
+              <div 
+                className={`bg-white border rounded-2xl p-5 shadow-sm transition-all duration-300 ${
+                  isDragOver 
+                    ? "border-indigo-500 bg-indigo-50/20 ring-4 ring-indigo-500/10 scale-[1.01]" 
+                    : "border-slate-200/80 hover:border-slate-300"
+                }`}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+              >
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2 mb-2">
+                  <Upload className="w-4 h-4 text-indigo-500" />
+                  <span>내 PC 파일 직접 업로드 변환</span>
+                </h3>
+                <p className="text-slate-500 text-[11px] leading-relaxed mb-4">
+                  보유하신 한글(.hwp), 워드(.docx), 문서 파일을 끌어다 놓거나 아래 버튼을 통해 즉시 클라우드 가상 버퍼로 업로드하여 고화질 PDF로 변환 및 다운로드할 수 있습니다.
+                </p>
+
+                <div 
+                  className={`border-2 border-dashed rounded-xl p-6 text-center flex flex-col items-center justify-center cursor-pointer transition-colors ${
+                    isDragOver 
+                      ? "border-indigo-400 bg-indigo-50/30" 
+                      : "border-slate-200 hover:border-indigo-400 bg-slate-50/40 hover:bg-indigo-50/5"
+                  }`}
+                  onClick={() => document.getElementById("local-file-picker")?.click()}
+                >
+                  <Upload className={`w-8 h-8 mb-2.5 transition-transform ${isDragOver ? "text-indigo-600 scale-110 animate-bounce" : "text-slate-400"}`} />
+                  <p className="text-xs font-bold text-slate-700">마우스로 파일을 끌어놓거나 클릭하세요</p>
+                  <p className="text-[10px] text-slate-450 mt-1">HWP, DOCX, DOC, XLS, PPT, TXT, PDF 등 지원</p>
+                  
+                  <input 
+                    type="file" 
+                    id="local-file-picker"
+                    multiple
+                    className="hidden" 
+                    onChange={(e) => handleLocalFilesUpload(e.target.files)}
+                  />
+                </div>
               </div>
 
               {/* QUEUE MONITOR AREA */}
