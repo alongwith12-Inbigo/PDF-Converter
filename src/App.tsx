@@ -38,6 +38,7 @@ import {
 } from "./lib/drive";
 import { User, onAuthStateChanged } from "firebase/auth";
 import { auth } from "./lib/drive";
+import { convertLocalFileToPdf } from "./lib/localConverter";
 
 interface ConversionTask {
   id: string;
@@ -573,7 +574,6 @@ export default function App() {
   // Core conversion execution pipeline (handles both Google Drive files and local uploaded files)
   const runConversion = async (tasks: ConversionTask[], overrideToken?: string) => {
     const activeToken = overrideToken || token;
-    if (!activeToken) return;
 
     setIsConverting(true);
     const successfulPdfs: { name: string; blob: Blob }[] = [];
@@ -596,22 +596,16 @@ export default function App() {
         let pdfBlob: Blob;
 
         if (task.localFile) {
-          // Local File Conversion Flow:
-          updateTaskStatus("uploading", "임시 구글 가상 변환기로 업로드 중...");
-          const tempDocId = await uploadAndConvertToGoogleDoc(activeToken, task.name, task.localFile);
-
-          try {
-            updateTaskStatus("exporting", "고화질 PDF로 문서 포맷 렌더링 중...");
-            pdfBlob = await exportGoogleDocToPdf(activeToken, tempDocId);
-          } finally {
-            // Cleanup from user's Drive right away
-            try {
-              await deleteDriveFile(activeToken, tempDocId);
-            } catch (e) {
-              console.warn("임시 파일 정리 실패:", e);
-            }
-          }
+          // Local File Conversion Flow (No Google Login Required):
+          updateTaskStatus("converting", "로컬 문서 분석 및 PDF 변환 준비 중...");
+          pdfBlob = await convertLocalFileToPdf(task.localFile, (progressText) => {
+            updateTaskStatus("converting", progressText);
+          });
         } else {
+          if (!activeToken) {
+            throw new Error("구글 드라이브 파일 변환을 위해 Google 계정 연결이 필요합니다.");
+          }
+
           // Google Drive File Conversion Flow:
           const isGoogleDoc = 
             task.mimeType.startsWith("application/vnd.google-apps.document") || 
@@ -669,14 +663,15 @@ export default function App() {
         console.error(`변환 실패 (${task.name}):`, err);
         const errMsg = String(err.message || "").toLowerCase();
         if (
-          errMsg.includes("401") ||
-          errMsg.includes("403") ||
-          errMsg.includes("credential") ||
-          errMsg.includes("credentials") ||
-          errMsg.includes("unauthorized") ||
-          errMsg.includes("invalid") ||
-          errMsg.includes("auth") ||
-          errMsg.includes("token")
+          !task.localFile &&
+          (errMsg.includes("401") ||
+            errMsg.includes("403") ||
+            errMsg.includes("credential") ||
+            errMsg.includes("credentials") ||
+            errMsg.includes("unauthorized") ||
+            errMsg.includes("invalid") ||
+            errMsg.includes("auth") ||
+            errMsg.includes("token"))
         ) {
           handleLogout();
           alert("구글 연동 위임 권한 세션이 만료되었습니다. 안전한 기동을 위해 재로그인을 완료하시기 바랍니다.");
@@ -710,7 +705,7 @@ export default function App() {
         document.body.removeChild(link);
       } catch (zipErr) {
         console.error("ZIP 파일 제작 실패:", zipErr);
-        alert("ZIP 압축 생성 도중 에러가 발생했습니다. 하단 개별 변환 완료창에서 각 파일을 재다운로드해 주십시오.");
+        alert("ZIP 압축 생성 도중 에러가 발생했습니다. 하단 실시간 변환 트래커에서 각 파일을 재다운로드해 주십시오.");
       }
     }
 
@@ -734,46 +729,10 @@ export default function App() {
     await runConversion(tasks);
   };
 
-  // Handle local file uploads conversion
+  // Handle local file uploads conversion (100% client-side, NO Google login required)
   const handleLocalFilesUpload = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
 
-    // Check Google Login first
-    if (!token) {
-      const confirmLogin = window.confirm(
-        "로컬 파일 직접 업로드 변환 기능은 실시간 임시 구글 Docs 가상 변환기를 가동하므로, 최초 1회의 안전한 Google 계정 연결 위임 처리가 필요합니다.\n\n구글 계정 연결을 가동하시겠습니까?"
-      );
-      if (confirmLogin) {
-        try {
-          setIsLoggingIn(true);
-          const result = await googleSignIn();
-          if (result) {
-            setToken(result.accessToken);
-            setUser(result.user);
-            setAccessToken(result.accessToken);
-            
-            // Build tasks and run using newly obtained token
-            const tasks: ConversionTask[] = Array.from(fileList).map((file, idx) => ({
-              id: `local-${Date.now()}-${idx}-${Math.random()}`,
-              name: file.name,
-              mimeType: file.type || "application/octet-stream",
-              status: "idle",
-              progressText: "대기 중...",
-              localFile: file,
-            }));
-            setConversionQueue(tasks);
-            await runConversion(tasks, result.accessToken);
-          }
-        } catch (err: any) {
-          alert("구글 계정 연동 실패: " + (err.message || "로그인 불가"));
-        } finally {
-          setIsLoggingIn(false);
-        }
-      }
-      return;
-    }
-
-    // Already signed in
     const tasks: ConversionTask[] = Array.from(fileList).map((file, idx) => ({
       id: `local-${Date.now()}-${idx}-${Math.random()}`,
       name: file.name,
@@ -913,7 +872,7 @@ export default function App() {
               </span>
             </h1>
             <p className="text-xs text-slate-500 mt-0.5">
-              별도의 프로그램 설치 없이 누구나 구글 드라이브 속 모든 문서를 고품질 PDF로 즉석 가공합니다
+              별도의 프로그램 설치 없이 내 PC 문서(.hwp, .docx 등)와 구글 드라이브 문서를 고품질 PDF로 즉석 가공합니다
             </p>
           </div>
         </div>
@@ -949,216 +908,382 @@ export default function App() {
               </button>
             </div>
           ) : (
-            <span className="text-xs text-slate-400">구글 연결 대기중</span>
+            <span className="text-xs text-slate-400">내 PC 변환 즉시 사용 가능 · 구글 드라이브 미연결</span>
           )}
         </div>
       </header>
 
-      {/* CORE WORKSPACE */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        {/* LINK DIRECT PASTE CONVERTER */}
-        <div className="col-span-12 bg-white border border-slate-200/85 rounded-2xl p-5 md:p-6 shadow-sm">
-          <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-            <div className="flex items-start gap-3.5">
-              <div className="p-3 bg-indigo-50 text-indigo-600 rounded-xl shrink-0">
-                <FileDown className="w-6 h-6 stroke-[2]" />
+      {/* CORE WORKSPACE: LEFT = 내 PC 파일 자동 변환, RIGHT = 구글 드라이브 */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+
+        {/* ==================== LEFT COLUMN (5 COLS): 내 PC 파일 자동 변환 ==================== */}
+        <section className="col-span-12 lg:col-span-5 flex flex-col gap-5">
+
+          {/* Local PC File Direct Auto-Conversion Card (NO Google Login Required) */}
+          <motion.div
+            initial={{ opacity: 0, x: -16 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ duration: 0.4 }}
+            className={`bg-white border rounded-2xl p-5 md:p-6 shadow-sm transition-all duration-300 ${
+              isDragOver
+                ? "border-indigo-500 bg-indigo-50/20 ring-4 ring-indigo-500/10 scale-[1.01]"
+                : "border-slate-200/85 hover:border-slate-300"
+            }`}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
+            <div className="flex items-start justify-between gap-3 mb-3">
+              <div className="flex items-center gap-3">
+                <div className="bg-gradient-to-tr from-blue-500 to-indigo-600 text-white p-2.5 rounded-xl shadow-md shadow-indigo-600/15 shrink-0">
+                  <Upload className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-base font-extrabold text-slate-900 tracking-tight">
+                    내 PC 파일 자동 변환
+                  </h2>
+                  <p className="text-[11px] text-emerald-600 font-bold mt-0.5">
+                    구글 로그인 불필요 · 브라우저 즉시 변환
+                  </p>
+                </div>
               </div>
-              <div>
-                <h2 className="text-base font-bold text-slate-900 tracking-tight">구글 드라이브 간편 링크 직접 변환기 (로그인 불필요)</h2>
-                <p className="text-xs text-slate-500 mt-1 leading-normal max-w-3xl">
-                  편집/조회 권한이 있는 공유 폴더 링크나 개별 구글 문서(Docs, Sheets, Slides), 파일 링크를 복사하여 아래에 붙여넣어 보세요. 
-                  폴더는 연동 즉시 화면이 자동 전환되고, 개별 문서는 구글 로그인 없이도 즉시 PDF 다운로드가 작동합니다!
+              <span className="shrink-0 px-2 py-0.5 text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md">
+                무인증 즉시 실행
+              </span>
+            </div>
+
+            <p className="text-slate-500 text-xs leading-relaxed mb-4">
+              보유하신 한글(.hwp/.hwpx), 워드(.docx), 엑셀(.xlsx/.csv), 텍스트, 이미지 파일을 끌어다 놓거나 클릭하면 로그인 없이 즉시 내 브라우저에서 고화질 PDF로 변환·다운로드됩니다.
+            </p>
+
+            <div
+              className={`border-2 border-dashed rounded-2xl p-7 text-center flex flex-col items-center justify-center cursor-pointer transition-colors ${
+                isDragOver
+                  ? "border-indigo-400 bg-indigo-50/40"
+                  : "border-slate-250 hover:border-indigo-400 bg-slate-50/60 hover:bg-indigo-50/10"
+              }`}
+              onClick={() => document.getElementById("local-file-picker")?.click()}
+            >
+              <Upload
+                className={`w-9 h-9 mb-2.5 transition-transform ${
+                  isDragOver ? "text-indigo-600 scale-110 animate-bounce" : "text-indigo-500/70"
+                }`}
+              />
+              <p className="text-xs font-bold text-slate-800">
+                마우스로 파일을 끌어놓거나 클릭하여 선택하세요
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                HWP, HWPX, DOCX, XLSX, XLS, CSV, TXT, 이미지, PDF 지원
+              </p>
+              <p className="text-[10px] text-slate-400 mt-2">
+                ※ 파일이 외부 서버로 업로드되지 않고 내 PC 메모리에서 직접 변환됩니다.
+              </p>
+
+              <input
+                type="file"
+                id="local-file-picker"
+                multiple
+                accept=".hwp,.hwpx,.hml,.docx,.xlsx,.xls,.csv,.txt,.md,.html,.htm,.pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp"
+                className="hidden"
+                onChange={(e) => {
+                  handleLocalFilesUpload(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+          </motion.div>
+
+          {/* Shared Output / Download Options Card */}
+          <div className="bg-white border border-slate-200/85 rounded-2xl p-5 shadow-sm space-y-3">
+            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <Settings className="w-4 h-4 text-indigo-500" />
+              <span>PDF 저장 및 파일명 옵션</span>
+            </h3>
+
+            <div className="flex items-start gap-2.5 p-3 bg-indigo-50/50 border border-indigo-100 rounded-xl">
+              <input
+                type="checkbox"
+                id="rename-on-download-cb"
+                checked={renameOnDownload}
+                onChange={(e) => setRenameOnDownload(e.target.checked)}
+                className="rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500 w-4 h-4 cursor-pointer mt-0.5 shrink-0"
+              />
+              <div className="text-left">
+                <label htmlFor="rename-on-download-cb" className="text-xs font-bold text-slate-800 cursor-pointer select-none">
+                  PDF 다운로드 시 학번만 추출하여 저장
+                </label>
+                <p className="text-[10px] text-slate-500 leading-normal mt-0.5">
+                  파일명에 5자리 학번이 감지되면 저장 파일명을 해당 학번(예: 10101.pdf)으로 자동 지정합니다.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2.5 p-3 bg-blue-50/50 border border-blue-100 rounded-xl">
+              <input
+                type="checkbox"
+                id="download-as-zip-cb"
+                checked={downloadAsZip}
+                onChange={(e) => setDownloadAsZip(e.target.checked)}
+                className="rounded border-blue-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer mt-0.5 shrink-0"
+              />
+              <div className="text-left">
+                <label htmlFor="download-as-zip-cb" className="text-xs font-bold text-slate-800 cursor-pointer select-none">
+                  일괄 다운로드 시 하나의 ZIP 압축파일로 받기
+                </label>
+                <p className="text-[10px] text-slate-500 leading-normal mt-0.5">
+                  여러 파일을 변환할 때 개별 다운로드 대신 하나의 .zip 패키지로 묶어 다운로드합니다.
                 </p>
               </div>
             </div>
           </div>
 
-          <div className="mt-4 flex flex-col sm:flex-row gap-3">
-            <div className="relative flex-1">
-              <input 
-                type="text"
-                placeholder="구글 드라이브 공유 폴더 혹은 문서 링크 복사 후 붙여넣기 (예: https://drive.google.com/... 또는 https://docs.google.com/...)"
-                value={pastedUrl}
-                onChange={(e) => setPastedUrl(e.target.value)}
-                className="w-full bg-slate-50 border border-slate-250 text-slate-800 placeholder-slate-400 focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30 text-sm pl-4 pr-10 py-3 rounded-xl outline-none transition-all font-sans"
-              />
-              {pastedUrl && (
-                <button
-                  onClick={() => setPastedUrl("")}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-650 font-medium"
-                >
-                  지우기
-                </button>
-              )}
-            </div>
-            <button
-              onClick={() => parsedLink && handleLinkAction(parsedLink)}
-              disabled={!parsedLink || parsedLink.type === "unknown" || isUrlProcessing}
-              className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white font-semibold text-sm px-6 py-3 rounded-xl transition-all flex items-center justify-center gap-2 shrink-0 h-[46px]"
-            >
-              {isUrlProcessing ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                "분석 및 변환 실행"
-              )}
-            </button>
-          </div>
+          {/* Real-time Conversion Queue Monitor (Always accessible, even without Google login!) */}
+          {conversionQueue.length > 0 && (
+            <div className="bg-white border border-slate-200/85 rounded-2xl p-5 shadow-sm flex flex-col">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-150">
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <span>실시간 변환 트래커</span>
+                  <span className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded border border-indigo-100">
+                    {conversionQueue.filter(q => q.status === "completed").length} / {conversionQueue.length} 완료
+                  </span>
+                </h3>
 
-          {/* Real-time description card based on Parsed Link */}
-          {parsedLink && (
-            <div className={`mt-3.5 p-4 rounded-xl border border-slate-150 text-xs text-slate-650 leading-relaxed shadow-inner ${
-              parsedLink.type === "unknown" ? "bg-rose-50/50 border-rose-150" : "bg-slate-50"
-            }`}>
-              {parsedLink.type === "folder" ? (
-                <div className="space-y-1">
-                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-50 text-blue-600 font-bold border border-blue-100/50">
-                    📂 구글 드라이브 폴더가 감지되었습니다
-                  </span>
-                  <p className="mt-1.5">
-                    {token 
-                      ? "사용자 연동 세션이 활성화 중이므로, '분석 및 변환 실행' 클릭 시 즉시 해당 공유 폴더 내부로 화면이 자동 전환되어 한글/문서 파일을 한 번에 체크하여 일괄로 다룰 수 있습니다." 
-                      : "구글 보안 정책상 폴더 속 상세 파일 리스트를 검색하고 조회하려면 1회성 구글 위임 권한이 필요합니다. '분석 및 변환 실행'을 누르시면 [구글 로그인 연동]과 함께 즉시 해당 공유 폴더로 순간 이동합니다."}
-                  </p>
-                </div>
-              ) : parsedLink.type === "document" || parsedLink.type === "spreadsheet" || parsedLink.type === "presentation" ? (
-                <div className="space-y-1">
-                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-50 text-emerald-600 font-bold border border-emerald-100/50">
-                    📝 구글 스마트 오피스 문서 양식 감지됨
-                  </span>
-                  <p className="mt-1.5">
-                    해당 파일의 권한 설정이 '링크가 있는 모든 사용자'로 공유 설정되어 있는 경우, <strong>구글 로그인 없이도 바로 PDF로 백업 렌더링된 사본 다운로딩이 개시</strong>됩니다! 
-                    로그인 없이 즉시 문서 PDF를 획득해 보세요.
-                  </p>
-                </div>
-              ) : parsedLink.type === "file" ? (
-                <div className="space-y-1">
-                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-amber-50 text-amber-600 font-bold border border-amber-100/50">
-                    📎 업로드형 바이너리 공유 파일 감지됨
-                  </span>
-                  <p className="mt-1.5">
-                    원본 아래 한글파일(.hwp)이나 워드(.docx) 등은 구글 드라이브 오피스 연동 가상 변환기를 구동하여 보안 가상 업로드 상태에서 처리해야 안전합니다. 
-                    따라서 <strong>구글 로그인이 필수적</strong>이며, 로그인 상태로 '분석 및 변환 실행' 시 모든 가공 작업이 오토매틱하게 원터치 진행됩니다.
-                  </p>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2 text-rose-600">
-                  <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
-                  <p className="font-semibold">유효한 구글 드라이브 공유 링크 구조가 아닙니다. 공유 폴더 혹은 문서 공유 URL 형식인지 확인 후 다시 장착해 주십시오.</p>
-                </div>
-              )}
+                <button
+                  onClick={() => setConversionQueue([])}
+                  disabled={isConverting}
+                  className="text-[11px] text-slate-500 hover:text-slate-700 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-md hover:bg-slate-100 transition-colors disabled:opacity-50"
+                >
+                  초기화
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto divide-y divide-slate-100 mt-2 pr-1 max-h-[360px]">
+                {conversionQueue.map((task) => (
+                  <div key={task.id} className="py-3 text-left space-y-1.5">
+                    <div className="flex items-center justify-between gap-3 text-xs">
+                      <span className="font-bold text-slate-800 truncate flex-1">{task.name}</span>
+
+                      {task.status === "idle" && (
+                        <span className="text-[10px] text-slate-400 bg-slate-50 px-2 py-0.5 rounded border border-slate-200">대기중</span>
+                      )}
+                      {task.status === "converting" && (
+                        <span className="text-[10px] text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100 flex items-center gap-1">
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" /> 브라우저 변환중
+                        </span>
+                      )}
+                      {task.status === "downloading" && (
+                        <span className="text-[10px] text-sky-600 bg-sky-50 px-2 py-0.5 rounded border border-sky-100 flex items-center gap-1">
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" /> 드라이브 다운로드중
+                        </span>
+                      )}
+                      {task.status === "uploading" && (
+                        <span className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded border border-blue-100 flex items-center gap-1">
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" /> 가상 변환 버퍼 처리중
+                        </span>
+                      )}
+                      {task.status === "exporting" && (
+                        <span className="text-[10px] text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100 flex items-center gap-1">
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" /> PDF 렌더링중
+                        </span>
+                      )}
+                      {task.status === "completed" && (
+                        <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100 flex items-center gap-1">
+                          <CheckCircle className="w-3 h-3" /> 완료
+                        </span>
+                      )}
+                      {task.status === "failed" && (
+                        <span className="text-[10px] text-rose-600 bg-rose-50 px-2 py-0.5 rounded border border-rose-100 flex items-center gap-1">
+                          <XCircle className="w-3 h-3" /> 실패
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="relative w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                      <div
+                        className={`absolute left-0 top-0 h-full rounded-full transition-all duration-300 ${
+                          task.status === "completed" ? "bg-emerald-500 w-full" :
+                          task.status === "failed" ? "bg-rose-500 w-full" :
+                          task.status === "idle" ? "bg-slate-300 w-0" : "bg-indigo-500 w-[60%] animate-pulse"
+                        }`}
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between text-[11px] text-slate-500 gap-2">
+                      <span className="truncate">{task.progressText}</span>
+                      {task.pdfUrl && (
+                        <a
+                          href={task.pdfUrl}
+                          download={(() => {
+                            let downloadName = task.name.replace(/\.[a-zA-Z0-9]+$/, "");
+                            if (renameOnDownload) {
+                              const match = task.name.match(/(?<!\d)(\d{5})(?!\d)/);
+                              if (match) {
+                                downloadName = match[1];
+                              }
+                            }
+                            return `${downloadName}.pdf`;
+                          })()}
+                          className="text-indigo-600 hover:underline font-semibold flex items-center gap-1 shrink-0"
+                        >
+                          <Download className="w-3 h-3" /> 재다운로드
+                        </a>
+                      )}
+                    </div>
+
+                    {task.error && (
+                      <p className="text-[10px] text-rose-600 bg-rose-50/70 p-2 rounded border border-rose-100">
+                        {task.error}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
-        </div>
 
-        {/* IF NOT LOGGED IN & NO TOKEN */}
-        {!user || !token ? (
-          <div className="col-span-12 flex flex-col items-center justify-center py-6 px-4">
-            <div className="w-full max-w-5xl grid grid-cols-1 md:grid-cols-2 gap-8 items-stretch">
-              
-              {/* Left Column: Google Login */}
-              <motion.div 
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.5 }}
-                className="bg-white border border-slate-200/80 rounded-3xl p-8 shadow-xl text-center flex flex-col justify-between"
-              >
-                <div>
-                  <div className="relative inline-block mb-6">
-                    <div className="absolute inset-0 bg-indigo-100 rounded-3xl blur-md scale-110"></div>
-                    <div className="relative bg-gradient-to-tr from-indigo-500 to-blue-600 text-white p-5 rounded-2xl shadow-lg">
-                      <FileDown className="w-10 h-10" />
-                    </div>
-                  </div>
-                  <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">구글 드라이브 원격 탐색기 기동</h2>
-                  <p className="text-slate-500 text-xs mt-3 leading-relaxed max-w-sm mx-auto">
-                    안전한 원격 공유 폴더 탐색과 한글(.hwp) 변환 파이프라인 원클릭 가동, 다중 파일 일괄 렌더링을 시작하시려면 신속한 Google 계정 연결을 실행하십시오.
-                  </p>
-                </div>
+        </section>
 
-                <div className="mt-8 space-y-4">
-                  <button
-                    onClick={handleLogin}
-                    disabled={isLoggingIn}
-                    className="w-full flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3.5 px-6 rounded-2xl shadow-lg shadow-indigo-600/20 active:scale-[0.98] transition-all disabled:opacity-75 disabled:cursor-not-allowed cursor-pointer"
-                  >
-                    {isLoggingIn ? (
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                    ) : (
-                      <svg className="w-5 h-5" viewBox="0 0 48 48">
-                        <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
-                        <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
-                        <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
-                        <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
-                      </svg>
-                    )}
-                    <span className="font-semibold text-sm">구글 계정 연결하고 탐색기 기동</span>
-                  </button>
+        {/* ==================== RIGHT COLUMN (7 COLS): 구글 드라이브 ==================== */}
+        <section className="col-span-12 lg:col-span-7 flex flex-col gap-5">
 
-                  <div className="text-[11px] text-slate-450 text-center">
-                    본 클라이언트 변환 엔진은 어떠한 사용자 암호 토큰도 수집하지 않으며 메모리 파기 시 자동 영구 폐기됩니다.
-                  </div>
-                </div>
-              </motion.div>
-
-              {/* Right Column: Local Drag & Drop Upload */}
-              <motion.div 
-                initial={{ opacity: 0, x: 20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.5 }}
-                className={`bg-white border rounded-3xl p-8 shadow-xl text-center flex flex-col justify-between transition-all duration-300 ${
-                  isDragOver 
-                    ? "border-indigo-500 bg-indigo-50/20 ring-4 ring-indigo-500/10 scale-[1.01]" 
-                    : "border-slate-200/80 hover:border-slate-300"
-                }`}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-              >
-                <div>
-                  <div className="relative inline-block mb-6">
-                    <div className="absolute inset-0 bg-blue-100 rounded-3xl blur-md scale-110"></div>
-                    <div className="relative bg-gradient-to-tr from-blue-500 to-indigo-600 text-white p-5 rounded-2xl shadow-lg">
-                      <Upload className="w-10 h-10" />
-                    </div>
-                  </div>
-                  <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">내 PC 파일 직접 드롭 및 자동 변환</h2>
-                  <p className="text-slate-500 text-xs mt-3 leading-relaxed max-w-sm mx-auto">
-                    가지고 계신 한글(.hwp), 워드(.docx) 파일을 아래 전용 드롭존에 즉시 투하하거나 클릭하여 실시간 변환 다운로드를 개시하십시오.
-                  </p>
-                </div>
-
-                <div className="mt-6 space-y-4">
-                  <div 
-                    className={`border-2 border-dashed rounded-2xl p-8 text-center flex flex-col items-center justify-center cursor-pointer transition-colors ${
-                      isDragOver 
-                        ? "border-indigo-400 bg-indigo-50/30" 
-                        : "border-slate-200 hover:border-indigo-400 bg-slate-50/40 hover:bg-indigo-50/5"
-                    }`}
-                    onClick={() => document.getElementById("local-file-picker-unauth")?.click()}
-                  >
-                    <Upload className={`w-10 h-10 mb-2 transition-transform ${isDragOver ? "text-indigo-600 scale-110 animate-bounce" : "text-slate-400"}`} />
-                    <p className="text-xs font-bold text-slate-700">마우스로 로컬 파일을 끌어놓거나 클릭하세요</p>
-                    <p className="text-[10px] text-slate-450 mt-1">HWP, DOCX, DOC, XLS, PPT, TXT, PDF 등 지원</p>
-                    <p className="text-[10px] text-indigo-500 font-bold mt-2">※ 파일 변환을 위한 1회성 간편 구글 로그인이 자동 연계됩니다.</p>
-                    
-                    <input 
-                      type="file" 
-                      id="local-file-picker-unauth"
-                      multiple
-                      className="hidden" 
-                      onChange={(e) => handleLocalFilesUpload(e.target.files)}
-                    />
-                  </div>
-                </div>
-              </motion.div>
-
+          {/* Google Drive Direct Link Paste Converter */}
+          <div className="bg-white border border-slate-200/85 rounded-2xl p-5 shadow-sm">
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 bg-indigo-50 text-indigo-600 rounded-xl shrink-0">
+                <FileDown className="w-5 h-5 stroke-[2]" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-slate-900 tracking-tight">
+                  구글 드라이브 간편 링크 직접 변환기
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5 leading-normal">
+                  공유 폴더 링크나 개별 구글 문서(Docs, Sheets, Slides) 링크를 붙여넣으세요. 공개된 구글 문서는 로그인 없이 즉시 PDF 다운로드됩니다.
+                </p>
+              </div>
             </div>
+
+            <div className="mt-3.5 flex flex-col sm:flex-row gap-2.5">
+              <div className="relative flex-1">
+                <input
+                  type="text"
+                  placeholder="https://drive.google.com/... 또는 https://docs.google.com/..."
+                  value={pastedUrl}
+                  onChange={(e) => setPastedUrl(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-200 text-slate-800 placeholder-slate-400 focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30 text-sm pl-3.5 pr-12 py-2.5 rounded-xl outline-none transition-all font-sans"
+                />
+                {pastedUrl && (
+                  <button
+                    onClick={() => setPastedUrl("")}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-600 font-medium"
+                  >
+                    지우기
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={() => parsedLink && handleLinkAction(parsedLink)}
+                disabled={!parsedLink || parsedLink.type === "unknown" || isUrlProcessing}
+                className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white font-semibold text-sm px-5 py-2.5 rounded-xl transition-all flex items-center justify-center gap-2 shrink-0 cursor-pointer disabled:cursor-not-allowed"
+              >
+                {isUrlProcessing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  "분석 및 변환"
+                )}
+              </button>
+            </div>
+
+            {parsedLink && (
+              <div className={`mt-3 p-3.5 rounded-xl border text-xs text-slate-600 leading-relaxed ${
+                parsedLink.type === "unknown" ? "bg-rose-50/50 border-rose-200" : "bg-slate-50 border-slate-200/70"
+              }`}>
+                {parsedLink.type === "folder" ? (
+                  <div className="space-y-1">
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-50 text-blue-600 font-bold border border-blue-100">
+                      📂 구글 드라이브 폴더가 감지되었습니다
+                    </span>
+                    <p className="mt-1">
+                      {token
+                        ? "'분석 및 변환' 클릭 시 해당 공유 폴더 내부로 즉시 이동하여 파일을 일괄 선택·변환할 수 있습니다."
+                        : "폴더 내부 파일 목록 조회를 위해 1회성 구글 계정 연결이 함께 진행됩니다."}
+                    </p>
+                  </div>
+                ) : parsedLink.type === "document" || parsedLink.type === "spreadsheet" || parsedLink.type === "presentation" ? (
+                  <div className="space-y-1">
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-50 text-emerald-600 font-bold border border-emerald-100">
+                      📝 구글 스마트 오피스 문서 양식 감지됨
+                    </span>
+                    <p className="mt-1">
+                      링크가 공개 설정되어 있는 경우 <strong>구글 로그인 없이도 바로 PDF 다운로드</strong>가 시작됩니다.
+                    </p>
+                  </div>
+                ) : parsedLink.type === "file" ? (
+                  <div className="space-y-1">
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-amber-50 text-amber-600 font-bold border border-amber-100">
+                      📎 드라이브 바이너리 공유 파일 감지됨
+                    </span>
+                    <p className="mt-1">
+                      구글 드라이브 내 업로드 파일은 우측 구글 계정 연결 후 원터치 변환이 가능합니다. (내 PC 파일은 왼쪽에서 로그인 없이 바로 변환하세요!)
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-rose-600">
+                    <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+                    <p className="font-semibold">유효한 구글 드라이브 공유 링크 형식이 아닙니다.</p>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
-        ) : (
-          <>
-            {/* FILE EXPLORER (LEFT - 7 COLUMNS) */}
-            <div className="col-span-12 lg:col-span-7 flex flex-col bg-white border border-slate-200/80 rounded-2xl shadow-sm overflow-hidden min-h-[600px]">
+
+          {/* IF NOT LOGGED IN & NO TOKEN: Google Drive Connect Card */}
+          {!user || !token ? (
+            <motion.div
+              initial={{ opacity: 0, x: 16 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ duration: 0.4 }}
+              className="bg-white border border-slate-200/85 rounded-2xl p-8 shadow-sm text-center flex flex-col items-center justify-center min-h-[380px]"
+            >
+              <div className="relative inline-block mb-5">
+                <div className="absolute inset-0 bg-indigo-100 rounded-3xl blur-md scale-110"></div>
+                <div className="relative bg-gradient-to-tr from-indigo-500 to-blue-600 text-white p-4 rounded-2xl shadow-lg">
+                  <FileDown className="w-9 h-9" />
+                </div>
+              </div>
+              <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">
+                구글 드라이브 원격 탐색기
+              </h2>
+              <p className="text-slate-500 text-xs mt-2.5 leading-relaxed max-w-md mx-auto">
+                구글 드라이브에 저장된 공유 폴더를 탐색하고, 여러 한글(.hwp)·구글 문서를 일괄 선택하여 PDF로 변환하거나 5자리 학번 파일명을 일괄 정리하려면 Google 계정을 연결하세요.
+              </p>
+
+              <div className="mt-7 w-full max-w-sm space-y-3">
+                <button
+                  onClick={handleLogin}
+                  disabled={isLoggingIn}
+                  className="w-full flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3.5 px-6 rounded-2xl shadow-lg shadow-indigo-600/20 active:scale-[0.98] transition-all disabled:opacity-75 disabled:cursor-not-allowed cursor-pointer"
+                >
+                  {isLoggingIn ? (
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : (
+                    <svg className="w-5 h-5" viewBox="0 0 48 48">
+                      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+                      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+                      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
+                      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+                    </svg>
+                  )}
+                  <span className="font-semibold text-sm">구글 계정 연결하고 드라이브 탐색기 열기</span>
+                </button>
+
+                <p className="text-[11px] text-slate-400">
+                  구글 드라이브 연동 없이 내 PC 파일만 변환하려면 왼쪽 드롭존을 바로 이용하시면 됩니다.
+                </p>
+              </div>
+            </motion.div>
+          ) : (
+            /* LOGGED IN: GOOGLE DRIVE EXPLORER & BATCH CONVERT ACTION */
+            <div className="flex flex-col bg-white border border-slate-200/85 rounded-2xl shadow-sm overflow-hidden min-h-[560px]">
               
               {/* Explorer Header & Controls */}
               <div className="p-4 border-b border-slate-200/80 bg-slate-50/50 space-y-3.5">
@@ -1166,13 +1291,13 @@ export default function App() {
                 {/* Search & Refresh */}
                 <div className="flex items-center gap-2">
                   <div className="relative flex-1">
-                    <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 o-4 text-slate-400" />
+                    <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                     <input 
                       type="text" 
-                      placeholder="내 드라이브에서 파일 검색하기..." 
+                      placeholder="내 구글 드라이브에서 파일 검색하기..." 
                       value={searchTerm}
                       onChange={(e) => setSearchTerm(e.target.value)}
-                      className="w-full bg-white border border-slate-200 pl-10 pr-4 py-2 text-sm rounded-xl focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all"
+                      className="w-full bg-white border border-slate-200 pl-10 pr-14 py-2 text-sm rounded-xl focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all"
                     />
                     {searchTerm && (
                       <button 
@@ -1269,6 +1394,41 @@ export default function App() {
                   </button>
                 </div>
 
+              </div>
+
+              {/* Selected Drive Files Action Bar */}
+              <div className="px-4 py-3 bg-indigo-50/40 border-b border-indigo-100/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <div className="text-xs text-slate-600 flex items-center gap-2">
+                  <span className="font-bold text-slate-800">구글 드라이브 선택 변환</span>
+                  {selectedFileIds.size > 0 ? (
+                    <span className="bg-indigo-600 text-white text-[11px] px-2 py-0.5 rounded-full font-bold">
+                      {selectedFileIds.size}개 선택됨
+                    </span>
+                  ) : (
+                    <span className="text-[11px] text-slate-400">아래 목록에서 변환할 파일을 체크하세요</span>
+                  )}
+                </div>
+                <button
+                  onClick={startPdfConversion}
+                  disabled={selectedFileIds.size === 0 || isConverting}
+                  className="flex items-center justify-center gap-2 bg-gradient-to-tr from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white font-semibold py-2 px-4 rounded-xl shadow-sm active:scale-[0.98] transition-all disabled:opacity-45 disabled:cursor-not-allowed text-xs shrink-0 cursor-pointer"
+                >
+                  {isConverting ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>PDF 변환 가공 중...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="w-3.5 h-3.5" />
+                      <span>
+                        {selectedFileIds.size > 0
+                          ? `선택 ${selectedFileIds.size}개 일괄 PDF 변환`
+                          : "일괄 PDF 변환 및 다운로드"}
+                      </span>
+                    </>
+                  )}
+                </button>
               </div>
 
               {/* Files Table / List */}
@@ -1422,244 +1582,9 @@ export default function App() {
               </div>
 
             </div>
+          )}
 
-            {/* CONVERSION PANEL (RIGHT - 5 COLUMNS) */}
-            <div className="col-span-12 lg:col-span-5 flex flex-col gap-6">
-              
-              {/* Actions and Status Card */}
-              <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-sm space-y-4">
-                <h2 className="text-base font-bold text-slate-950 flex items-center gap-2">
-                  <span>변환 및 다운로드 제어판</span>
-                  {selectedFileIds.size > 0 && (
-                    <span className="bg-indigo-500 text-white text-xs px-2.5 py-0.5 rounded-full font-bold animate-pulse">
-                      선택 {selectedFileIds.size}개
-                    </span>
-                  )}
-                </h2>
-
-                <p className="text-slate-500 text-xs">
-                  구글 드라이브 내에서 변환 대상 문서들을 체크한 뒤 아래 변환 버튼을 실행하면 다운로드가 즉시 생성됩니다. 한글 파일(.hwp) 형식도 완전 호환 처리됩니다.
-                </p>
-
-                <div className="flex items-start gap-2.5 p-3 bg-indigo-50/50 border border-indigo-100 rounded-xl">
-                  <input
-                    type="checkbox"
-                    id="rename-on-download-cb"
-                    checked={renameOnDownload}
-                    onChange={(e) => setRenameOnDownload(e.target.checked)}
-                    className="rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500 w-4 h-4 cursor-pointer mt-0.5 shrink-0"
-                  />
-                  <div className="text-left">
-                    <label htmlFor="rename-on-download-cb" className="text-xs font-bold text-slate-800 cursor-pointer select-none">
-                      PDF 다운로드 시 학번만 추출하여 저장
-                    </label>
-                    <p className="text-[10px] text-slate-500 leading-normal mt-0.5">
-                      파일명에 5자리 학번이 감지되면 다운로드 파일명을 해당 학번(예: 10101.pdf)으로 자동 지정합니다. (드라이브 원본 파일명 보존)
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-2.5 p-3 bg-blue-50/50 border border-blue-100 rounded-xl">
-                  <input
-                    type="checkbox"
-                    id="download-as-zip-cb"
-                    checked={downloadAsZip}
-                    onChange={(e) => setDownloadAsZip(e.target.checked)}
-                    className="rounded border-blue-300 text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer mt-0.5 shrink-0"
-                  />
-                  <div className="text-left">
-                    <label htmlFor="download-as-zip-cb" className="text-xs font-bold text-slate-800 cursor-pointer select-none">
-                      일괄 다운로드 시 하나의 ZIP 압축파일로 받기
-                    </label>
-                    <p className="text-[10px] text-slate-500 leading-normal mt-0.5">
-                      여러 파일을 일괄 변환할 때, 개별 다운로드하지 않고 하나의 .zip 패키지 파일로 묶어서 다운로드합니다. (기본: 개별 다운로드)
-                    </p>
-                  </div>
-                </div>
-
-                {selectedFileIds.size === 0 ? (
-                  <div className="bg-slate-50 rounded-xl p-5 text-center border border-slate-100 flex flex-col items-center justify-center min-h-[140px]">
-                    <FileText className="w-8 h-8 text-slate-350 stroke-[1.5] mb-2 animate-bounce" />
-                    <p className="text-slate-600 text-xs font-semibold">선택한 파일이 없습니다</p>
-                    <p className="text-[10px] text-slate-400 mt-1">왼쪽 파일 탐색기에서 한글파일, 워드 혹은 구글문서의 체크박스를 확인해 주세요.</p>
-                  </div>
-                ) : (
-                  <div className="space-y-3.5">
-                    <div className="outline-none py-1 overflow-y-auto max-h-[140px] divide-y divide-slate-100 border border-slate-100 rounded-xl bg-slate-50/50 p-2 text-xs">
-                      {files.filter(f => selectedFileIds.has(f.id)).map(file => (
-                        <div key={file.id} className="flex items-center justify-between p-1.5 gap-2 text-left">
-                          <span className="font-semibold text-slate-700 truncate flex-1">{file.name}</span>
-                          <span className="text-[10px] text-slate-400 shrink-0 font-mono">{formatBytes(file.size)}</span>
-                        </div>
-                      ))}
-                    </div>
-
-                    <button
-                      onClick={startPdfConversion}
-                      disabled={isConverting}
-                      className="w-full flex items-center justify-center gap-2 bg-gradient-to-tr from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white font-semibold py-3 px-5 rounded-xl shadow-lg shadow-indigo-600/10 active:scale-[0.98] transition-all disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                    >
-                      {isConverting ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          <span>PDF 변환 가공 중...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Download className="w-4 h-4" />
-                          <span>선택 {selectedFileIds.size}개 일괄 PDF 변환 및 다운로드</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Local File Direct Upload Card */}
-              <div 
-                className={`bg-white border rounded-2xl p-5 shadow-sm transition-all duration-300 ${
-                  isDragOver 
-                    ? "border-indigo-500 bg-indigo-50/20 ring-4 ring-indigo-500/10 scale-[1.01]" 
-                    : "border-slate-200/80 hover:border-slate-300"
-                }`}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-              >
-                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2 mb-2">
-                  <Upload className="w-4 h-4 text-indigo-500" />
-                  <span>내 PC 파일 직접 업로드 변환</span>
-                </h3>
-                <p className="text-slate-500 text-[11px] leading-relaxed mb-4">
-                  보유하신 한글(.hwp), 워드(.docx), 문서 파일을 끌어다 놓거나 아래 버튼을 통해 즉시 클라우드 가상 버퍼로 업로드하여 고화질 PDF로 변환 및 다운로드할 수 있습니다.
-                </p>
-
-                <div 
-                  className={`border-2 border-dashed rounded-xl p-6 text-center flex flex-col items-center justify-center cursor-pointer transition-colors ${
-                    isDragOver 
-                      ? "border-indigo-400 bg-indigo-50/30" 
-                      : "border-slate-200 hover:border-indigo-400 bg-slate-50/40 hover:bg-indigo-50/5"
-                  }`}
-                  onClick={() => document.getElementById("local-file-picker")?.click()}
-                >
-                  <Upload className={`w-8 h-8 mb-2.5 transition-transform ${isDragOver ? "text-indigo-600 scale-110 animate-bounce" : "text-slate-400"}`} />
-                  <p className="text-xs font-bold text-slate-700">마우스로 파일을 끌어놓거나 클릭하세요</p>
-                  <p className="text-[10px] text-slate-450 mt-1">HWP, DOCX, DOC, XLS, PPT, TXT, PDF 등 지원</p>
-                  
-                  <input 
-                    type="file" 
-                    id="local-file-picker"
-                    multiple
-                    className="hidden" 
-                    onChange={(e) => handleLocalFilesUpload(e.target.files)}
-                  />
-                </div>
-              </div>
-
-              {/* QUEUE MONITOR AREA */}
-              {conversionQueue.length > 0 && (
-                <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-sm flex-1 flex flex-col min-h-[300px]">
-                  <div className="flex items-center justify-between pb-3 border-b border-slate-150">
-                    <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                      <span>실시간 변환 트래커</span>
-                      <span className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded border border-indigo-100">
-                        {conversionQueue.filter(q => q.status === "completed").length} / {conversionQueue.length} 완료
-                      </span>
-                    </h3>
-                    
-                    <button 
-                      onClick={() => setConversionQueue([])}
-                      disabled={isConverting}
-                      className="text-[11px] text-slate-450 hover:text-slate-650 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-md hover:bg-slate-100 transition-colors disabled:opacity-50"
-                    >
-                      초기화
-                    </button>
-                  </div>
-
-                  <div className="flex-1 overflow-y-auto divide-y divide-slate-100 mt-2 pr-1 max-h-[350px]">
-                    {conversionQueue.map((task) => (
-                      <div key={task.id} className="py-3 text-left space-y-1.5">
-                        <div className="flex items-center justify-between gap-3 text-xs">
-                          <span className="font-bold text-slate-800 truncate flex-1">{task.name}</span>
-                          
-                          {/* Task Badges */}
-                          {task.status === "idle" && (
-                            <span className="text-[10px] text-slate-400 bg-slate-50 px-2 py-0.5 rounded border border-slate-200">대기중</span>
-                          )}
-                          {task.status === "downloading" && (
-                            <span className="text-[10px] text-sky-650 bg-sky-50 px-2 py-0.5 rounded border border-sky-100 flex items-center gap-1">
-                              <Loader2 className="w-2.5 h-2.5 animate-spin" /> 구글 드라이브 다운로드중
-                            </span>
-                          )}
-                          {task.status === "uploading" && (
-                            <span className="text-[10px] text-blue-650 bg-blue-50 px-2 py-0.5 rounded border border-blue-100 flex items-center gap-1">
-                              <Loader2 className="w-2.5 h-2.5 animate-spin" /> 구글 문서 가상 업로드중
-                            </span>
-                          )}
-                          {task.status === "exporting" && (
-                            <span className="text-[10px] text-indigo-650 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100 flex items-center gap-1">
-                              <Loader2 className="w-2.5 h-2.5 animate-spin" /> PDF 고화질 렌더링중
-                            </span>
-                          )}
-                          {task.status === "completed" && (
-                            <span className="text-[10px] text-emerald-650 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100 flex items-center gap-1">
-                              <CheckCircle className="w-3 h-3" /> 변환 및 다운로드 성공
-                            </span>
-                          )}
-                          {task.status === "failed" && (
-                            <span className="text-[10px] text-rose-650 bg-rose-50 px-2 py-0.5 rounded border border-rose-100 flex items-center gap-1">
-                              <XCircle className="w-3 h-3" /> 실패
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Progress Status Bar */}
-                        <div className="relative w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                          <div 
-                            className={`absolute left-0 top-0 h-full rounded-full transition-all duration-300 ${
-                              task.status === "completed" ? "bg-emerald-500 w-full" :
-                              task.status === "failed" ? "bg-rose-500 w-full" :
-                              task.status === "idle" ? "bg-slate-300 w-0" : "bg-indigo-500 w-[55%] animate-pulse"
-                            }`}
-                          />
-                        </div>
-
-                        <div className="flex items-center justify-between text-[11px] text-slate-450">
-                          <span>{task.progressText}</span>
-                          {task.pdfUrl && (
-                            <a 
-                              href={task.pdfUrl} 
-                              download={(() => {
-                                let downloadName = task.name.replace(/\.[a-zA-Z0-9]+$/, "");
-                                if (renameOnDownload) {
-                                  const match = task.name.match(/(?<!\d)(\d{5})(?!\d)/);
-                                  if (match) {
-                                    downloadName = match[1];
-                                  }
-                                }
-                                return `${downloadName}.pdf`;
-                              })()}
-                              className="text-indigo-600 hover:underline font-semibold flex items-center gap-1"
-                            >
-                              <Download className="w-3 h-3" /> 개별 재다운로드
-                            </a>
-                          )}
-                        </div>
-
-                        {task.error && (
-                          <p className="text-[10px] text-rose-650 bg-rose-50/55 p-1.5 rounded border border-rose-100">
-                            {task.error}
-                          </p>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-            </div>
-          </>
-        )}
+        </section>
 
       </main>
 
@@ -1679,23 +1604,23 @@ export default function App() {
 
               <div className="mt-4 space-y-4 text-sm text-slate-600 leading-relaxed text-left">
                 <div>
-                  <h4 className="font-bold text-slate-800">1. 한글 파일(.hwp) 지원 기술 원리</h4>
+                  <h4 className="font-bold text-slate-800">1. 내 PC 파일 무로그인 즉시 변환 (왼쪽)</h4>
                   <p className="text-xs text-slate-500 mt-1">
-                    구글 드라이브 API는 한글 문서 파일을 Drive로 업로드하면서 Google Docs 타입 포맷으로 자동 번역하여 읽을 수 있습니다.이 변환 과정에서 생성된 구글 문서 템플릿 파일은 PDF 내보내기 엔진을 거쳐 고화질 PDF 결과물로 재해석되며, 임시 구글 문서는 파일 정보 노출 방지를 위해 사용자의 컴퓨터로 저장 완료되는 즉시 구글 드라이브에서 깔끔히 소멸됩니다!
+                    한글(.hwp/.hwpx), 워드(.docx), 엑셀(.xlsx/.csv), 텍스트, 이미지 파일은 구글 로그인 없이 브라우저 내장 WASM 엔진과 렌더링 파이프라인으로 즉시 PDF 변환됩니다. 파일은 외부 서버로 전송되지 않습니다.
                   </p>
                 </div>
 
                 <div>
-                  <h4 className="font-bold text-slate-800">2. 파일 선택 및 일괄 가공</h4>
+                  <h4 className="font-bold text-slate-800">2. 구글 드라이브 탐색 & 일괄 가공 (오른쪽)</h4>
                   <p className="text-xs text-slate-500 mt-1">
-                    내 드라이브 속 임의의 폴더를 브라우즈 할 수 있으며, 최상위 선택 옵션을 통해 한 번에 여러 개의 문서를 담아 "일괄 PDF 변환기" 큐를 구동하고 연속 다운로드 트리거할 수 있습니다.
+                    구글 계정을 연결하면 드라이브 폴더 탐색, 다중 파일 일괄 PDF 변환, 5자리 학번 파일명 일괄 정리를 한 번에 처리할 수 있습니다.
                   </p>
                 </div>
 
                 <div>
                   <h4 className="font-bold text-slate-800">3. 개인정보 보호 & 보안</h4>
                   <p className="text-xs text-slate-500 mt-1">
-                    우리의 서비스는 Firebase Auth를 통한 사용자 메모리 기반 인가 처리를 준수합니다. 어떠한 인증 키나 드라이브 자료도 외부 서버로 영구 백업되지 않습니다.
+                    로컬 변환은 전적으로 내 브라우저 메모리 내에서만 실행되며, 구글 드라이브 연동 시에도 외부 서버에 인증 키나 문서를 저장하지 않습니다.
                   </p>
                 </div>
               </div>
