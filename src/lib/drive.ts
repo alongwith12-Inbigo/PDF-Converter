@@ -11,7 +11,7 @@ export const provider = new GoogleAuthProvider();
 provider.addScope("https://www.googleapis.com/auth/drive");
 
 let isSigningIn = false;
-let cachedAccessToken: string | null = typeof window !== "undefined" ? localStorage.getItem("gdrive_access_token") : null;
+let cachedAccessToken: string | null = null;
 
 // Initialize auth state listener.
 export const initAuth = (
@@ -20,18 +20,14 @@ export const initAuth = (
 ) => {
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
-      if (!cachedAccessToken) {
-        cachedAccessToken = localStorage.getItem("gdrive_access_token");
-      }
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
-      } else {
-        // Fallback to signin popup if cached is lost but user is logged in
+      } else if (!isSigningIn) {
+        cachedAccessToken = null;
         if (onAuthFailure) onAuthFailure();
       }
     } else {
       cachedAccessToken = null;
-      localStorage.removeItem("gdrive_access_token");
       if (onAuthFailure) onAuthFailure();
     }
   });
@@ -44,11 +40,10 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
-      throw new Error("Failed to get access token from Firebase Auth");
+      throw new Error("Google 드라이브 액세스 토큰을 가져오지 못했습니다.");
     }
 
     cachedAccessToken = credential.accessToken;
-    localStorage.setItem("gdrive_access_token", cachedAccessToken);
     return { user: result.user, accessToken: cachedAccessToken };
   } catch (error: any) {
     console.error("Sign in error:", error);
@@ -62,24 +57,18 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 export const logout = async () => {
   await auth.signOut();
   cachedAccessToken = null;
-  localStorage.removeItem("gdrive_access_token");
 };
 
 export const clearCachedToken = () => {
   cachedAccessToken = null;
-  localStorage.removeItem("gdrive_access_token");
 };
 
 export const getAccessToken = (): string | null => {
-  if (!cachedAccessToken && typeof window !== "undefined") {
-    cachedAccessToken = localStorage.getItem("gdrive_access_token");
-  }
   return cachedAccessToken;
 };
 
 export const setAccessToken = (token: string) => {
   cachedAccessToken = token;
-  localStorage.setItem("gdrive_access_token", token);
 };
 
 export interface DriveFile {

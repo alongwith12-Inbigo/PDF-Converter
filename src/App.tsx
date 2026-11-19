@@ -34,6 +34,7 @@ import {
   deleteDriveFile,
   renameDriveFile,
   DriveFile,
+  getAccessToken,
   setAccessToken
 } from "./lib/drive";
 import { User, onAuthStateChanged } from "firebase/auth";
@@ -56,6 +57,7 @@ export default function App() {
   const [token, setToken] = useState<string | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
 
   // Files & Folders Browse State
   const [currentFolderId, setCurrentFolderId] = useState<string>("root");
@@ -159,11 +161,9 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
         setUser(currentUser);
-        // Under AI Studio workspace, we get the access token from Firebase authentication provider 
-        // When user logs in, we grab it.
-        const savedToken = localStorage.getItem("gdrive_access_token");
-        if (savedToken) {
-          setToken(savedToken);
+        const memoryToken = getAccessToken();
+        if (memoryToken) {
+          setToken(memoryToken);
         }
       } else {
         setUser(null);
@@ -212,6 +212,7 @@ export default function App() {
 
   const handleLogin = async () => {
     setIsLoggingIn(true);
+    setLoginError(null);
     try {
       const response = await googleSignIn();
       if (response) {
@@ -219,8 +220,18 @@ export default function App() {
         setUser(response.user);
         setSelectedFileIds(new Set());
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Google Sign-In failed:", err);
+      const code = String(err?.code || "");
+      if (code === "auth/popup-blocked") {
+        setLoginError("브라우저에서 로그인 팝업이 차단되었습니다. 팝업 차단을 해제한 뒤 다시 시도해 주세요.");
+      } else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
+        setLoginError("로그인 창이 닫혔습니다. 다시 시도해 주세요.");
+      } else if (code === "auth/unauthorized-domain") {
+        setLoginError("현재 도메인이 Firebase 승인 도메인에 등록되지 않았습니다. 앱을 새로고침한 뒤 다시 시도해 주세요.");
+      } else {
+        setLoginError(`로그인 실패: ${err?.message || "알 수 없는 오류가 발생했습니다."}`);
+      }
     } finally {
       setIsLoggingIn(false);
     }
@@ -1258,6 +1269,20 @@ export default function App() {
               </p>
 
               <div className="mt-7 w-full max-w-sm space-y-3">
+                {loginError && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs text-left flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-500" />
+                    <span className="flex-1 leading-relaxed">{loginError}</span>
+                    <button
+                      onClick={() => setLoginError(null)}
+                      className="text-rose-400 hover:text-rose-600 font-bold shrink-0"
+                      aria-label="오류 닫기"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+
                 <button
                   onClick={handleLogin}
                   disabled={isLoggingIn}
