@@ -19,7 +19,10 @@ import {
   Settings,
   HelpCircle,
   FileDown,
-  Upload
+  Upload,
+  Copy,
+  Check,
+  ExternalLink
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
@@ -33,6 +36,8 @@ import {
   uploadAndConvertToGoogleDoc,
   deleteDriveFile,
   renameDriveFile,
+  diagnoseAuthDomain,
+  AuthDomainDiagnostics,
   DriveFile,
   getAccessToken,
   setAccessToken
@@ -58,6 +63,8 @@ export default function App() {
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [domainDiag, setDomainDiag] = useState<AuthDomainDiagnostics | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState(false);
 
   // Files & Folders Browse State
   const [currentFolderId, setCurrentFolderId] = useState<string>("root");
@@ -210,9 +217,37 @@ export default function App() {
     }
   };
 
+  const handleAuthError = async (err: any) => {
+    console.error("Google Sign-In failed:", err);
+    const code = String(err?.code || "");
+    if (code === "auth/popup-blocked") {
+      setDomainDiag(null);
+      setLoginError("브라우저에서 로그인 팝업이 차단되었습니다. 팝업 차단을 해제한 뒤 다시 시도해 주세요.");
+    } else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
+      setDomainDiag(null);
+      setLoginError("로그인 창이 닫혔습니다. 다시 시도해 주세요.");
+    } else if (code === "auth/unauthorized-domain") {
+      const diag = await diagnoseAuthDomain();
+      setDomainDiag(diag);
+      if (diag.isAuthorized) {
+        setLoginError(
+          `현재 도메인(${diag.hostname})은 Firebase 프로젝트(${diag.projectId})에 승인되어 있으나, 브라우저에 이전 설정/오류 상태가 캐시되어 실패했을 수 있습니다. 아래 버튼으로 페이지를 새로고침한 뒤 다시 시도해 주세요.`
+        );
+      } else {
+        setLoginError(
+          `현재 접속 도메인(${diag.hostname || "알 수 없음"})이 연동된 Firebase 프로젝트(${diag.projectId})의 승인된 도메인에 등록되어 있지 않습니다.`
+        );
+      }
+    } else {
+      setDomainDiag(null);
+      setLoginError(`로그인 실패: ${err?.message || "알 수 없는 오류가 발생했습니다."}`);
+    }
+  };
+
   const handleLogin = async () => {
     setIsLoggingIn(true);
     setLoginError(null);
+    setDomainDiag(null);
     try {
       const response = await googleSignIn();
       if (response) {
@@ -221,17 +256,7 @@ export default function App() {
         setSelectedFileIds(new Set());
       }
     } catch (err: any) {
-      console.error("Google Sign-In failed:", err);
-      const code = String(err?.code || "");
-      if (code === "auth/popup-blocked") {
-        setLoginError("브라우저에서 로그인 팝업이 차단되었습니다. 팝업 차단을 해제한 뒤 다시 시도해 주세요.");
-      } else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
-        setLoginError("로그인 창이 닫혔습니다. 다시 시도해 주세요.");
-      } else if (code === "auth/unauthorized-domain") {
-        setLoginError("현재 도메인이 Firebase 승인 도메인에 등록되지 않았습니다. 앱을 새로고침한 뒤 다시 시도해 주세요.");
-      } else {
-        setLoginError(`로그인 실패: ${err?.message || "알 수 없는 오류가 발생했습니다."}`);
-      }
+      await handleAuthError(err);
     } finally {
       setIsLoggingIn(false);
     }
@@ -340,7 +365,15 @@ export default function App() {
         if (!token) {
           // If not logged in, request login first
           setIsLoggingIn(true);
-          const response = await googleSignIn();
+          setLoginError(null);
+          setDomainDiag(null);
+          let response = null;
+          try {
+            response = await googleSignIn();
+          } catch (loginErr: any) {
+            await handleAuthError(loginErr);
+            return;
+          }
           if (response) {
             setToken(response.accessToken);
             setUser(response.user);
@@ -1270,16 +1303,93 @@ export default function App() {
 
               <div className="mt-7 w-full max-w-sm space-y-3">
                 {loginError && (
-                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs text-left flex items-start gap-2">
-                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-500" />
-                    <span className="flex-1 leading-relaxed">{loginError}</span>
-                    <button
-                      onClick={() => setLoginError(null)}
-                      className="text-rose-400 hover:text-rose-600 font-bold shrink-0"
-                      aria-label="오류 닫기"
-                    >
-                      ✕
-                    </button>
+                  <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs text-left space-y-2.5">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-500" />
+                      <span className="flex-1 leading-relaxed font-medium">{loginError}</span>
+                      <button
+                        onClick={() => {
+                          setLoginError(null);
+                          setDomainDiag(null);
+                        }}
+                        className="text-rose-400 hover:text-rose-600 font-bold shrink-0 cursor-pointer"
+                        aria-label="오류 닫기"
+                      >
+                        ✕
+                      </button>
+                    </div>
+
+                    {domainDiag && (
+                      <div className="bg-white/80 border border-rose-200/80 rounded-lg p-2.5 space-y-2 text-[11px] text-slate-700">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-slate-500 shrink-0">현재 도메인:</span>
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <code className="px-1.5 py-0.5 bg-slate-100 rounded text-[10px] font-mono truncate">
+                              {domainDiag.hostname || "(확인 불가)"}
+                            </code>
+                            {domainDiag.hostname && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  navigator.clipboard?.writeText(domainDiag.hostname);
+                                  setCopiedDomain(true);
+                                  setTimeout(() => setCopiedDomain(false), 1800);
+                                }}
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[10px] font-semibold shrink-0 cursor-pointer"
+                                title="도메인 복사"
+                              >
+                                {copiedDomain ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                                {copiedDomain ? "복사됨" : "복사"}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-slate-500 shrink-0">연동 프로젝트:</span>
+                          <code className="px-1.5 py-0.5 bg-indigo-50 text-indigo-700 rounded text-[10px] font-mono truncate">
+                            {domainDiag.projectId}
+                          </code>
+                        </div>
+
+                        {!domainDiag.isAuthorized && (
+                          <div className="pt-1 border-t border-rose-100 space-y-1.5 text-[10px] text-slate-600 leading-relaxed">
+                            <p>
+                              1. 아래 링크를 열어 <strong>Authentication → Settings → 승인된 도메인</strong>에{" "}
+                              <strong className="text-slate-900">{domainDiag.hostname}</strong> 을 추가하세요. (다른 프로젝트가 아닌{" "}
+                              <strong>{domainDiag.projectId}</strong> 에 추가해야 합니다.)
+                            </p>
+                            {domainDiag.authorizedDomains.length > 0 && (
+                              <p className="text-slate-400 break-all">
+                                현재 승인됨: {domainDiag.authorizedDomains.join(", ")}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          {!domainDiag.isAuthorized && (
+                            <a
+                              href={`https://console.firebase.google.com/project/${domainDiag.projectId}/authentication/settings`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-semibold transition-colors"
+                            >
+                              Firebase 승인 도메인 설정
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => window.location.reload()}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-900 text-white rounded-lg text-[11px] font-semibold transition-colors cursor-pointer"
+                          >
+                            <RefreshCw className="w-3 h-3" />
+                            새로고침 후 다시 시도
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 

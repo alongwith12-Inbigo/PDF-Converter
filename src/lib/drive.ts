@@ -5,6 +5,56 @@ import firebaseConfig from "../../firebase-applet-config.json";
 // Initialize Firebase App
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+export const firebaseProjectId = firebaseConfig.projectId;
+
+export interface AuthDomainDiagnostics {
+  hostname: string;
+  origin: string;
+  projectId: string;
+  authorizedDomains: string[];
+  isAuthorized: boolean;
+}
+
+const matchesAuthorizedDomain = (hostname: string, expected: string): boolean => {
+  if (!hostname || !expected) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(expected)) {
+    return hostname === expected;
+  }
+  const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp(`^(.+\\.${escaped}|${escaped})$`, "i");
+  return regex.test(hostname);
+};
+
+export const diagnoseAuthDomain = async (): Promise<AuthDomainDiagnostics> => {
+  const hostname = typeof window !== "undefined" ? window.location.hostname : "";
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  let authorizedDomains: string[] = [];
+
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/projects?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+      { cache: "no-store" }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.authorizedDomains)) {
+        authorizedDomains = data.authorizedDomains;
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to fetch Firebase authorizedDomains:", e);
+  }
+
+  const isAuthorized = authorizedDomains.some((d) => matchesAuthorizedDomain(hostname, d));
+
+  return {
+    hostname,
+    origin,
+    projectId: firebaseConfig.projectId,
+    authorizedDomains,
+    isAuthorized,
+  };
+};
 
 // Use Google Auth Provider
 export const provider = new GoogleAuthProvider();
