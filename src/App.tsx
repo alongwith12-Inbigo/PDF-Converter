@@ -22,7 +22,10 @@ import {
   Upload,
   Copy,
   Check,
-  ExternalLink
+  ExternalLink,
+  HardDrive,
+  Users,
+  X
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
@@ -31,6 +34,7 @@ import {
   logout, 
   fetchDriveFiles, 
   fetchFolderName,
+  fetchSharedDrives,
   downloadDriveFileBlob,
   exportGoogleDocToPdf,
   uploadAndConvertToGoogleDoc,
@@ -38,6 +42,7 @@ import {
   renameDriveFile,
   diagnoseAuthDomain,
   AuthDomainDiagnostics,
+  SharedDriveInfo,
   DriveFile,
   getAccessToken,
   setAccessToken
@@ -67,17 +72,24 @@ export default function App() {
   const [copiedDomain, setCopiedDomain] = useState(false);
 
   // Files & Folders Browse State
+  const [browseScope, setBrowseScope] = useState<"folder" | "sharedWithMe">("folder");
+  const [activeRootKey, setActiveRootKey] = useState<string>("root");
+  const [sharedDrives, setSharedDrives] = useState<SharedDriveInfo[]>([]);
   const [currentFolderId, setCurrentFolderId] = useState<string>("root");
-  const [folderPath, setFolderPath] = useState<{ id: string; name: string }[]>([
-    { id: "root", name: "내 드라이브" }
+  const [folderPath, setFolderPath] = useState<{ id: string; name: string; scope?: "folder" | "sharedWithMe" }[]>([
+    { id: "root", name: "내 드라이브", scope: "folder" }
   ]);
   const [files, setFiles] = useState<DriveFile[]>([]);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
+  const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("");
   const [filterType, setFilterType] = useState<"all" | "hwp" | "google_doc" | "other">("all");
 
-  // Selection & Actions
-  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
+  // Cross-Folder Persistent Selection & Actions
+  const [selectedFilesMap, setSelectedFilesMap] = useState<Record<string, DriveFile & { pathLabel: string }>>({});
+  const selectedFileIds = useMemo(() => new Set(Object.keys(selectedFilesMap)), [selectedFilesMap]);
+  const selectedFilesList = useMemo(() => Object.values(selectedFilesMap), [selectedFilesMap]);
+  const currentPathLabel = useMemo(() => folderPath.map(p => p.name).join(" > "), [folderPath]);
   const [conversionQueue, setConversionQueue] = useState<ConversionTask[]>([]);
   const [isConverting, setIsConverting] = useState(false);
 
@@ -182,22 +194,42 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Fetch file list when token details or folders change
+  // Debounce search query to avoid spamming Drive API while typing
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearchTerm(searchTerm);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchTerm]);
+
+  // Fetch Shared Drives once when logged in
+  useEffect(() => {
+    if (!token) {
+      setSharedDrives([]);
+      return;
+    }
+    fetchSharedDrives(token).then(setSharedDrives).catch(() => setSharedDrives([]));
+  }, [token]);
+
+  // Fetch file list when token, path, scope, or search changes
   useEffect(() => {
     if (token) {
-      loadFiles(currentFolderId);
+      loadFiles(currentFolderId, debouncedSearchTerm, browseScope);
     }
-  }, [token, currentFolderId, searchTerm]);
+  }, [token, currentFolderId, debouncedSearchTerm, browseScope]);
 
-  const loadFiles = async (folderId: string) => {
+  const loadFiles = async (
+    folderId: string = currentFolderId,
+    queryText: string = debouncedSearchTerm,
+    scope: "folder" | "sharedWithMe" = browseScope
+  ) => {
     if (!token) return;
     setIsLoadingFiles(true);
     try {
-      const fetched = await fetchDriveFiles(token, folderId, searchTerm);
+      const fetched = await fetchDriveFiles(token, folderId, queryText, scope);
       setFiles(fetched);
     } catch (err: any) {
       console.error("파일 로딩 에러:", err);
-      // If unauthorized, token might be expired. Force relogin or reset.
       const errMsg = String(err.message || "").toLowerCase();
       if (
         errMsg.includes("401") ||
@@ -209,8 +241,8 @@ export default function App() {
         errMsg.includes("auth") ||
         errMsg.includes("token")
       ) {
-        handleLogout();
-        alert("구글 연동 위임 권한 세션이 만료되었거나 로그인 값이 올바르지 않습니다. 안전한 정밀 조작을 위해 로그인을 진행하시기 바랍니다.");
+        await handleLogout();
+        setLoginError("구글 드라이브 인증 세션이 만료되었습니다. 다시 로그인해 주세요.");
       }
     } finally {
       setIsLoadingFiles(false);
@@ -253,7 +285,7 @@ export default function App() {
       if (response) {
         setToken(response.accessToken);
         setUser(response.user);
-        setSelectedFileIds(new Set());
+        setSelectedFilesMap({});
       }
     } catch (err: any) {
       await handleAuthError(err);
@@ -267,7 +299,12 @@ export default function App() {
     setUser(null);
     setToken(null);
     setFiles([]);
-    setSelectedFileIds(new Set());
+    setSharedDrives([]);
+    setBrowseScope("folder");
+    setActiveRootKey("root");
+    setCurrentFolderId("root");
+    setFolderPath([{ id: "root", name: "내 드라이브", scope: "folder" }]);
+    setSelectedFilesMap({});
     setConversionQueue([]);
   };
 
@@ -378,26 +415,28 @@ export default function App() {
             setToken(response.accessToken);
             setUser(response.user);
             const folderName = await fetchFolderName(response.accessToken, parsed.id);
+            setBrowseScope("folder");
+            setActiveRootKey("root");
             setFolderPath([
-              { id: "root", name: "내 드라이브" },
-              { id: parsed.id, name: folderName || "공유된 폴더" }
+              { id: "root", name: "내 드라이브", scope: "folder" },
+              { id: parsed.id, name: folderName || "공유된 폴더", scope: "folder" }
             ]);
             setCurrentFolderId(parsed.id);
+            setSearchTerm("");
             setPastedUrl("");
-            setSelectedFileIds(new Set());
-            alert(`구글 로그인 연동 성공! 감지된 폴더 [${folderName || "공유된 폴더"}]로 바로 순간이동했습니다.`);
           }
         } else {
-          // If logged in, navigate straight there
+          // If logged in, navigate straight there while preserving already selected files
           const folderName = await fetchFolderName(token, parsed.id);
+          setBrowseScope("folder");
+          setActiveRootKey("root");
           setFolderPath([
-            { id: "root", name: "내 드라이브" },
-            { id: parsed.id, name: folderName || "공유된 폴더" }
+            { id: "root", name: "내 드라이브", scope: "folder" },
+            { id: parsed.id, name: folderName || "공유된 폴더", scope: "folder" }
           ]);
           setCurrentFolderId(parsed.id);
+          setSearchTerm("");
           setPastedUrl("");
-          setSelectedFileIds(new Set());
-          alert(`감지된 폴더 [${folderName || "공유된 폴더"}]로 바로 순간이동했습니다!`);
         }
       } else if (parsed.type === "document" || parsed.type === "spreadsheet" || parsed.type === "presentation") {
         // Direct PDF converter triggers
@@ -547,22 +586,45 @@ export default function App() {
     }
   };
 
-  // Directory Drilling Navigation
+  // Switch Drive root (내 드라이브 / 공유 문서함 / 공유 드라이브) while keeping selected files
+  const switchDriveRoot = (rootId: string, rootName: string, scope: "folder" | "sharedWithMe") => {
+    setActiveRootKey(rootId);
+    setBrowseScope(scope);
+    setSearchTerm("");
+    setDebouncedSearchTerm("");
+    setFolderPath([{ id: rootId, name: rootName, scope }]);
+    setCurrentFolderId(rootId);
+  };
+
+  // Directory Drilling Navigation (preserves selections across folders!)
   const navigateToFolder = async (folder: DriveFile) => {
     if (folder.mimeType !== "application/vnd.google-apps.folder") return;
-    
-    // Append to path breadcrumbs
-    const newPath = [...folderPath, { id: folder.id, name: folder.name }];
-    setFolderPath(newPath);
+
+    // If navigating out of search results, reset search so folder contents show immediately
+    if (searchTerm) {
+      setSearchTerm("");
+      setDebouncedSearchTerm("");
+    }
+
+    setBrowseScope("folder");
+    // Avoid duplicating the same trailing folder
+    setFolderPath(prev => {
+      if (prev[prev.length - 1]?.id === folder.id) return prev;
+      return [...prev, { id: folder.id, name: folder.name, scope: "folder" }];
+    });
     setCurrentFolderId(folder.id);
-    setSelectedFileIds(new Set());
   };
 
   const navigateToBreadcrumb = (index: number) => {
     const newPath = folderPath.slice(0, index + 1);
+    const target = newPath[newPath.length - 1];
     setFolderPath(newPath);
-    setCurrentFolderId(newPath[newPath.length - 1].id);
-    setSelectedFileIds(new Set());
+    setBrowseScope(target.scope || "folder");
+    setCurrentFolderId(target.id);
+    if (searchTerm) {
+      setSearchTerm("");
+      setDebouncedSearchTerm("");
+    }
   };
 
   const navigateUp = () => {
@@ -578,7 +640,7 @@ export default function App() {
 
       const name = file.name.toLowerCase();
       if (filterType === "hwp") {
-        return name.endsWith(".hwp") || file.mimeType.includes("hwp");
+        return name.endsWith(".hwp") || name.endsWith(".hwpx") || file.mimeType.includes("hwp");
       }
       if (filterType === "google_doc") {
         return file.mimeType.startsWith("application/vnd.google-apps.document") || 
@@ -586,7 +648,18 @@ export default function App() {
                file.mimeType.startsWith("application/vnd.google-apps.presentation");
       }
       if (filterType === "other") {
-        return name.endsWith(".docx") || file.mimeType.includes("officedocument") || file.mimeType === "application/pdf";
+        return (
+          name.endsWith(".docx") ||
+          name.endsWith(".doc") ||
+          name.endsWith(".xlsx") ||
+          name.endsWith(".xls") ||
+          name.endsWith(".pptx") ||
+          name.endsWith(".ppt") ||
+          name.endsWith(".txt") ||
+          name.endsWith(".csv") ||
+          file.mimeType.includes("officedocument") ||
+          file.mimeType === "application/pdf"
+        );
       }
       return true;
     });
@@ -594,25 +667,47 @@ export default function App() {
 
   const selectAllSelectableFiles = () => {
     const selectables = filteredFiles.filter(f => f.mimeType !== "application/vnd.google-apps.folder");
-    const allSelected = selectables.every(f => selectedFileIds.has(f.id));
+    const allSelected = selectables.length > 0 && selectables.every(f => selectedFileIds.has(f.id));
     
-    const newSelection = new Set(selectedFileIds);
-    if (allSelected) {
-      selectables.forEach(f => newSelection.delete(f.id));
-    } else {
-      selectables.forEach(f => newSelection.add(f.id));
-    }
-    setSelectedFileIds(newSelection);
+    setSelectedFilesMap(prev => {
+      const next = { ...prev };
+      if (allSelected) {
+        selectables.forEach(f => delete next[f.id]);
+      } else {
+        const label = debouncedSearchTerm ? "검색 결과" : currentPathLabel;
+        selectables.forEach(f => {
+          next[f.id] = { ...f, pathLabel: label };
+        });
+      }
+      return next;
+    });
   };
 
-  const toggleSelectFile = (fileId: string) => {
-    const newSelection = new Set(selectedFileIds);
-    if (newSelection.has(fileId)) {
-      newSelection.delete(fileId);
-    } else {
-      newSelection.add(fileId);
-    }
-    setSelectedFileIds(newSelection);
+  const toggleSelectFile = (file: DriveFile) => {
+    setSelectedFilesMap(prev => {
+      const next = { ...prev };
+      if (next[file.id]) {
+        delete next[file.id];
+      } else {
+        next[file.id] = {
+          ...file,
+          pathLabel: debouncedSearchTerm ? "검색 결과" : currentPathLabel,
+        };
+      }
+      return next;
+    });
+  };
+
+  const removeSelectedFile = (fileId: string) => {
+    setSelectedFilesMap(prev => {
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
+  };
+
+  const clearAllSelectedFiles = () => {
+    setSelectedFilesMap({});
   };
 
   // Core conversion execution pipeline (handles both Google Drive files and local uploaded files)
@@ -756,12 +851,11 @@ export default function App() {
     setIsConverting(false);
   };
 
-  // Convert files in selected list to PDF
+  // Convert files in selected list (across all visited folders!) to PDF
   const startPdfConversion = async () => {
-    if (selectedFileIds.size === 0 || !token) return;
+    if (selectedFilesList.length === 0 || !token) return;
 
-    const filesToConvert = files.filter(f => selectedFileIds.has(f.id));
-    const tasks: ConversionTask[] = filesToConvert.map(f => ({
+    const tasks: ConversionTask[] = selectedFilesList.map(f => ({
       id: f.id,
       name: f.name,
       mimeType: f.mimeType,
@@ -815,50 +909,64 @@ export default function App() {
 
     const lowerName = filename.toLowerCase();
     
-    if (lowerName.endsWith(".hwp")) {
+    if (lowerName.endsWith(".hwp") || lowerName.endsWith(".hwpx")) {
       return (
-        <span className="px-2 py-0.5 text-[11px] font-semibold bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-400 rounded-md border border-red-200 dark:border-red-900/50">
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-red-100 text-red-700 rounded-md border border-red-200">
           HWP 한글문서
         </span>
       );
     }
     if (mimeType.includes("wordprocessingml") || lowerName.endsWith(".docx") || lowerName.endsWith(".doc")) {
       return (
-        <span className="px-2 py-0.5 text-[11px] font-semibold bg-blue-100 text-blue-700 dark:bg-blue-950/40 dark:text-blue-400 rounded-md border border-blue-200 dark:border-blue-900/50">
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-blue-100 text-blue-700 rounded-md border border-blue-200">
           MS Word
+        </span>
+      );
+    }
+    if (mimeType.includes("spreadsheetml") || lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls") || lowerName.endsWith(".csv")) {
+      return (
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-emerald-100 text-emerald-700 rounded-md border border-emerald-200">
+          엑셀 / CSV
+        </span>
+      );
+    }
+    if (mimeType.includes("presentationml") || lowerName.endsWith(".pptx") || lowerName.endsWith(".ppt")) {
+      return (
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-amber-100 text-amber-700 rounded-md border border-amber-200">
+          파워포인트
         </span>
       );
     }
     if (mimeType.includes("google-apps.document")) {
       return (
-        <span className="px-2 py-0.5 text-[11px] font-semibold bg-indigo-100 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-400 rounded-md border border-indigo-200 dark:border-indigo-900/50">
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-indigo-100 text-indigo-700 rounded-md border border-indigo-200">
           구글 문서
         </span>
       );
     }
     if (mimeType.includes("google-apps.spreadsheet")) {
       return (
-        <span className="px-2 py-0.5 text-[11px] font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 rounded-md border border-emerald-200 dark:border-emerald-900/50">
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-emerald-100 text-emerald-700 rounded-md border border-emerald-200">
           스프레드시트
         </span>
       );
     }
     if (mimeType.includes("google-apps.presentation")) {
       return (
-        <span className="px-2 py-0.5 text-[11px] font-semibold bg-amber-100 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400 rounded-md border border-amber-200 dark:border-amber-900/50">
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-amber-100 text-amber-700 rounded-md border border-amber-200">
           프레젠테이션
         </span>
       );
     }
     if (mimeType === "application/pdf") {
       return (
-        <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 rounded-md">
+        <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 rounded-md">
           PDF
         </span>
       );
     }
     return (
-      <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-50 text-slate-600 dark:bg-slate-800 dark:text-slate-400 rounded-md">
+      <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-50 text-slate-600 rounded-md">
         일반 문서
       </span>
     );
@@ -1421,15 +1529,60 @@ export default function App() {
             <div className="flex flex-col bg-white border border-slate-200/85 rounded-2xl shadow-sm overflow-hidden min-h-[560px]">
               
               {/* Explorer Header & Controls */}
-              <div className="p-4 border-b border-slate-200/80 bg-slate-50/50 space-y-3.5">
-                
+              <div className="p-4 border-b border-slate-200/80 bg-slate-50/50 space-y-3">
+
+                {/* Drive Root Switcher (내 드라이브 / 공유 문서함 / 공유 드라이브) */}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => switchDriveRoot("root", "내 드라이브", "folder")}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all cursor-pointer ${
+                      activeRootKey === "root" && !debouncedSearchTerm
+                        ? "bg-slate-900 border-slate-900 text-white shadow-sm"
+                        : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    <HardDrive className="w-3.5 h-3.5" />
+                    <span>내 드라이브</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => switchDriveRoot("sharedWithMe", "공유 문서함", "sharedWithMe")}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all cursor-pointer ${
+                      activeRootKey === "sharedWithMe" && !debouncedSearchTerm
+                        ? "bg-slate-900 border-slate-900 text-white shadow-sm"
+                        : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    <Users className="w-3.5 h-3.5" />
+                    <span>공유 문서함</span>
+                  </button>
+
+                  {sharedDrives.map((sd) => (
+                    <button
+                      key={sd.id}
+                      type="button"
+                      onClick={() => switchDriveRoot(sd.id, sd.name, "folder")}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all cursor-pointer ${
+                        activeRootKey === sd.id && !debouncedSearchTerm
+                          ? "bg-slate-900 border-slate-900 text-white shadow-sm"
+                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+                      }`}
+                    >
+                      <Folder className="w-3.5 h-3.5" />
+                      <span className="max-w-[140px] truncate">{sd.name}</span>
+                    </button>
+                  ))}
+                </div>
+
                 {/* Search & Refresh */}
                 <div className="flex items-center gap-2">
                   <div className="relative flex-1">
                     <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                     <input 
                       type="text" 
-                      placeholder="내 구글 드라이브에서 파일 검색하기..." 
+                      placeholder="폴더명 또는 파일명으로 전체 드라이브 검색..." 
                       value={searchTerm}
                       onChange={(e) => setSearchTerm(e.target.value)}
                       className="w-full bg-white border border-slate-200 pl-10 pr-14 py-2 text-sm rounded-xl focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all"
@@ -1437,51 +1590,65 @@ export default function App() {
                     {searchTerm && (
                       <button 
                         onClick={() => setSearchTerm("")}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-450 hover:text-slate-600 bg-slate-100 rounded-md px-1.5 py-0.5"
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-slate-700 bg-slate-100 rounded-md px-1.5 py-0.5 cursor-pointer"
                       >
                         지우기
                       </button>
                     )}
                   </div>
                   <button 
-                    onClick={() => loadFiles(currentFolderId)}
+                    onClick={() => loadFiles(currentFolderId, debouncedSearchTerm, browseScope)}
                     disabled={isLoadingFiles}
-                    className="p-2.5 bg-white border border-slate-200 text-slate-600 hover:text-indigo-600 hover:border-indigo-100 hover:bg-indigo-50/20 active:scale-95 transition-all rounded-xl disabled:opacity-50"
+                    className="p-2.5 bg-white border border-slate-200 text-slate-600 hover:text-indigo-600 hover:border-indigo-100 hover:bg-indigo-50/20 active:scale-95 transition-all rounded-xl disabled:opacity-50 cursor-pointer"
                     title="새로고침"
                   >
                     <RefreshCw className={`w-4 h-4 ${isLoadingFiles ? "animate-spin" : ""}`} />
                   </button>
                 </div>
 
-                {/* Path and Breadcrumbs */}
-                <div className="flex items-center justify-between gap-2 overflow-x-auto pb-1 text-xs">
-                  <div className="flex items-center gap-1.5 text-slate-500 shrink-0">
-                    {folderPath.length > 1 && (
+                {/* Clickable Path / Breadcrumb Bar */}
+                <div className="flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs">
+                  <div className="flex items-center gap-1 overflow-x-auto min-w-0">
+                    {folderPath.length > 1 && !debouncedSearchTerm && (
                       <button 
+                        type="button"
                         onClick={navigateUp}
-                        className="p-1 text-slate-600 hover:bg-slate-200/70 rounded-md transition-colors mr-1"
-                        title="상위 폴더"
+                        className="inline-flex items-center gap-1 px-2 py-1 text-slate-700 bg-slate-100 hover:bg-slate-200/80 rounded-lg transition-colors mr-1.5 shrink-0 font-semibold cursor-pointer"
+                        title="상위 폴더로 이동"
                       >
                         <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>상위</span>
                       </button>
                     )}
-                    {folderPath.map((folder, idx) => (
-                      <div key={folder.id} className="flex items-center">
-                        {idx > 0 && <ChevronRight className="w-3 h-3 mx-1 text-slate-300" />}
-                        <button
-                          onClick={() => navigateToBreadcrumb(idx)}
-                          className={`hover:text-indigo-600 hover:underline font-medium ${
-                            idx === folderPath.length - 1 ? "text-slate-900 font-bold" : ""
-                          }`}
-                        >
-                          {folder.name}
-                        </button>
+
+                    {debouncedSearchTerm ? (
+                      <div className="flex items-center gap-1.5 text-indigo-700 font-semibold truncate">
+                        <Search className="w-3.5 h-3.5 shrink-0" />
+                        <span className="truncate">&ldquo;{debouncedSearchTerm}&rdquo; 검색 결과</span>
                       </div>
-                    ))}
+                    ) : (
+                      folderPath.map((folder, idx) => (
+                        <div key={`${folder.id}-${idx}`} className="flex items-center shrink-0">
+                          {idx > 0 && <ChevronRight className="w-3.5 h-3.5 mx-0.5 text-slate-300 shrink-0" />}
+                          <button
+                            type="button"
+                            onClick={() => navigateToBreadcrumb(idx)}
+                            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md transition-colors cursor-pointer ${
+                              idx === folderPath.length - 1
+                                ? "text-indigo-700 bg-indigo-50 font-bold"
+                                : "text-slate-600 hover:text-indigo-600 hover:bg-slate-100 font-medium"
+                            }`}
+                          >
+                            {idx === 0 && <Home className="w-3 h-3" />}
+                            <span className="max-w-[160px] truncate">{folder.name}</span>
+                          </button>
+                        </div>
+                      ))
+                    )}
                   </div>
 
-                  <span className="text-[11px] text-slate-400 bg-slate-100 rounded-full px-2 py-0.5">
-                    {filteredFiles.length}개 항목
+                  <span className="text-[11px] text-slate-500 bg-slate-100 rounded-full px-2.5 py-0.5 shrink-0 font-medium">
+                    폴더 {filteredFiles.filter(f => f.mimeType === "application/vnd.google-apps.folder").length} · 파일 {filteredFiles.filter(f => f.mimeType !== "application/vnd.google-apps.folder").length}
                   </span>
                 </div>
 
@@ -1489,81 +1656,116 @@ export default function App() {
                 <div className="flex flex-wrap gap-1.5">
                   <button
                     onClick={() => setFilterType("all")}
-                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all ${
+                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all cursor-pointer ${
                       filterType === "all"
                         ? "bg-indigo-600 border-indigo-600 text-white shadow-sm"
-                        : "bg-white border-slate-200 text-slate-650 hover:bg-slate-100"
+                        : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
                     }`}
                   >
-                    모체 전체
+                    전체
                   </button>
                   <button
                     onClick={() => setFilterType("hwp")}
-                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all ${
+                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all cursor-pointer ${
                       filterType === "hwp"
-                        ? "bg-red-650 border-red-650 text-white shadow-sm"
-                        : "bg-white border-slate-200 text-slate-650 hover:bg-slate-100"
+                        ? "bg-red-600 border-red-600 text-white shadow-sm"
+                        : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
                     }`}
                   >
-                    hwp 한글문서 (.hwp)
+                    한글문서 (.hwp/.hwpx)
                   </button>
                   <button
                     onClick={() => setFilterType("google_doc")}
-                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all ${
+                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all cursor-pointer ${
                       filterType === "google_doc"
                         ? "bg-indigo-600 border-indigo-600 text-white shadow-sm"
-                        : "bg-white border-slate-200 text-slate-650 hover:bg-slate-100"
+                        : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
                     }`}
                   >
                     구글 문서 양식
                   </button>
                   <button
                     onClick={() => setFilterType("other")}
-                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all ${
+                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all cursor-pointer ${
                       filterType === "other"
                         ? "bg-blue-600 border-blue-600 text-white shadow-sm"
-                        : "bg-white border-slate-200 text-slate-650 hover:bg-slate-100"
+                        : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
                     }`}
                   >
-                    MS 오피스 및 PDF
+                    오피스 및 PDF
                   </button>
                 </div>
 
               </div>
 
-              {/* Selected Drive Files Action Bar */}
-              <div className="px-4 py-3 bg-indigo-50/40 border-b border-indigo-100/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                <div className="text-xs text-slate-600 flex items-center gap-2">
-                  <span className="font-bold text-slate-800">구글 드라이브 선택 변환</span>
-                  {selectedFileIds.size > 0 ? (
-                    <span className="bg-indigo-600 text-white text-[11px] px-2 py-0.5 rounded-full font-bold">
-                      {selectedFileIds.size}개 선택됨
-                    </span>
-                  ) : (
-                    <span className="text-[11px] text-slate-400">아래 목록에서 변환할 파일을 체크하세요</span>
-                  )}
-                </div>
-                <button
-                  onClick={startPdfConversion}
-                  disabled={selectedFileIds.size === 0 || isConverting}
-                  className="flex items-center justify-center gap-2 bg-gradient-to-tr from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white font-semibold py-2 px-4 rounded-xl shadow-sm active:scale-[0.98] transition-all disabled:opacity-45 disabled:cursor-not-allowed text-xs shrink-0 cursor-pointer"
-                >
-                  {isConverting ? (
-                    <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      <span>PDF 변환 가공 중...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Download className="w-3.5 h-3.5" />
-                      <span>
-                        {selectedFileIds.size > 0
-                          ? `선택 ${selectedFileIds.size}개 일괄 PDF 변환`
-                          : "일괄 PDF 변환 및 다운로드"}
+              {/* Selected Drive Files Action Bar + Cross-Folder Basket */}
+              <div className="px-4 py-3 bg-indigo-50/40 border-b border-indigo-100/80 space-y-2.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                  <div className="text-xs text-slate-600 flex items-center gap-2 flex-wrap">
+                    <span className="font-bold text-slate-800">구글 드라이브 선택 변환</span>
+                    {selectedFilesList.length > 0 ? (
+                      <>
+                        <span className="bg-indigo-600 text-white text-[11px] px-2 py-0.5 rounded-full font-bold">
+                          총 {selectedFilesList.length}개 선택됨 (경로 이동 시 유지)
+                        </span>
+                        <button
+                          type="button"
+                          onClick={clearAllSelectedFiles}
+                          className="text-[11px] text-slate-500 hover:text-rose-600 underline cursor-pointer"
+                        >
+                          선택 비우기
+                        </button>
+                      </>
+                    ) : (
+                      <span className="text-[11px] text-slate-500">
+                        폴더를 눌러 경로를 이동하면서 변환할 파일을 체크하세요
                       </span>
-                    </>
-                  )}
-                </button>
+                    )}
+                  </div>
+                  <button
+                    onClick={startPdfConversion}
+                    disabled={selectedFilesList.length === 0 || isConverting}
+                    className="flex items-center justify-center gap-2 bg-gradient-to-tr from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white font-semibold py-2 px-4 rounded-xl shadow-sm active:scale-[0.98] transition-all disabled:opacity-45 disabled:cursor-not-allowed text-xs shrink-0 cursor-pointer"
+                  >
+                    {isConverting ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>PDF 변환 가공 중...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-3.5 h-3.5" />
+                        <span>
+                          {selectedFilesList.length > 0
+                            ? `선택 ${selectedFilesList.length}개 일괄 PDF 변환`
+                            : "일괄 PDF 변환 및 다운로드"}
+                        </span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {selectedFilesList.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto pt-1">
+                    {selectedFilesList.map((sf) => (
+                      <span
+                        key={sf.id}
+                        title={`${sf.pathLabel} / ${sf.name}`}
+                        className="inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 bg-white border border-indigo-200 rounded-lg text-[11px] text-slate-700 shadow-2xs max-w-[240px]"
+                      >
+                        <span className="truncate font-medium">{sf.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => removeSelectedFile(sf.id)}
+                          className="p-0.5 text-slate-400 hover:text-rose-600 rounded hover:bg-rose-50 cursor-pointer shrink-0"
+                          aria-label={`${sf.name} 선택 해제`}
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Files Table / List */}
@@ -1641,34 +1843,38 @@ export default function App() {
                             if (isFolder) {
                               navigateToFolder(file);
                             } else {
-                              toggleSelectFile(file.id);
+                              toggleSelectFile(file);
                             }
                           }}
-                          className={`flex items-center px-4 py-3 hover:bg-slate-50 cursor-pointer transition-all ${
-                            isSelected ? "bg-indigo-50/40 hover:bg-indigo-50/60" : ""
+                          className={`flex items-center px-4 py-3 transition-all cursor-pointer ${
+                            isFolder
+                              ? "hover:bg-amber-50/40"
+                              : isSelected
+                              ? "bg-indigo-50/40 hover:bg-indigo-50/60"
+                              : "hover:bg-slate-50"
                           }`}
                         >
                           <div 
                             className="w-10 shrink-0" 
                             onClick={(e) => {
                               e.stopPropagation(); // Prevent folder navigate
-                              if (!isFolder) toggleSelectFile(file.id);
+                              if (!isFolder) toggleSelectFile(file);
                             }}
                           >
                             {!isFolder ? (
                               <input 
                                 type="checkbox" 
                                 checked={isSelected}
-                                onChange={() => toggleSelectFile(file.id)}
+                                onChange={() => toggleSelectFile(file)}
                                 className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 w-4 h-4 cursor-pointer"
                               />
                             ) : (
-                              <Folder className="w-4 h-4 text-slate-400" />
+                              <Folder className="w-4 h-4 text-amber-500" />
                             )}
                           </div>
 
                           <div className="flex-1 min-w-0 flex items-center gap-3">
-                            <div className="shrink-0 p-1.5 bg-slate-100 rounded-lg">
+                            <div className={`shrink-0 p-1.5 rounded-lg ${isFolder ? "bg-amber-50" : "bg-slate-100"}`}>
                               {getFileIcon(file)}
                             </div>
                             <div className="text-left flex-1 min-w-0">
@@ -1683,7 +1889,13 @@ export default function App() {
                                 )}
                               </div>
                               <div className="flex items-center gap-2 mt-1">
-                                {getFormatBadge(file.mimeType, file.name)}
+                                {isFolder ? (
+                                  <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-50 text-amber-700 rounded border border-amber-200/70">
+                                    폴더 · 클릭해 열기
+                                  </span>
+                                ) : (
+                                  getFormatBadge(file.mimeType, file.name)
+                                )}
                                 {file.createdTime && (
                                   <span className="text-[10px] text-slate-400">
                                     {new Date(file.createdTime).toLocaleDateString()}
@@ -1693,19 +1905,28 @@ export default function App() {
                             </div>
                           </div>
 
-                          <div className="w-28 text-right text-xs text-slate-500 hidden sm:flex items-center justify-end gap-1.5 shrink-0">
-                            <span>{isFolder ? "디렉토리" : formatBytes(file.size)}</span>
-                            {renameCandidates.some(c => c.id === file.id) && (
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleSingleRename(file);
-                                }}
-                                className="ml-1 px-1.5 py-0.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-150 text-indigo-700 text-[10px] font-bold rounded-md transition-colors shrink-0 cursor-pointer"
-                                title="포함된 5자리 학번으로 파일명 정리"
-                              >
-                                학번정리
-                              </button>
+                          <div className="w-28 text-right text-xs text-slate-500 flex items-center justify-end gap-1.5 shrink-0">
+                            {isFolder ? (
+                              <span className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-1 rounded-lg border border-amber-200/60">
+                                열기
+                                <ChevronRight className="w-3.5 h-3.5" />
+                              </span>
+                            ) : (
+                              <>
+                                <span className="hidden sm:inline">{formatBytes(file.size)}</span>
+                                {renameCandidates.some(c => c.id === file.id) && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleSingleRename(file);
+                                    }}
+                                    className="ml-1 px-1.5 py-0.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-150 text-indigo-700 text-[10px] font-bold rounded-md transition-colors shrink-0 cursor-pointer"
+                                    title="포함된 5자리 학번으로 파일명 정리"
+                                  >
+                                    학번정리
+                                  </button>
+                                )}
+                              </>
                             )}
                           </div>
                         </div>

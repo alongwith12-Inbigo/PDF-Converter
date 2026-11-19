@@ -129,54 +129,158 @@ export interface DriveFile {
   size?: string;
   createdTime?: string;
   parents?: string[];
+  shortcutDetails?: {
+    targetId: string;
+    targetMimeType: string;
+  };
 }
 
-// Fetch Drive files or folders
+export interface SharedDriveInfo {
+  id: string;
+  name: string;
+}
+
+const SUPPORTED_MIME_AND_NAME_FILTER =
+  "(mimeType = 'application/vnd.google-apps.folder'" +
+  " or mimeType = 'application/vnd.google-apps.shortcut'" +
+  " or mimeType = 'application/vnd.google-apps.document'" +
+  " or mimeType = 'application/vnd.google-apps.spreadsheet'" +
+  " or mimeType = 'application/vnd.google-apps.presentation'" +
+  " or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'" +
+  " or mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'" +
+  " or mimeType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'" +
+  " or mimeType = 'application/pdf'" +
+  " or mimeType = 'text/plain'" +
+  " or mimeType = 'text/csv'" +
+  " or name contains '.hwp'" +
+  " or name contains '.docx'" +
+  " or name contains '.doc'" +
+  " or name contains '.xlsx'" +
+  " or name contains '.xls'" +
+  " or name contains '.pptx'" +
+  " or name contains '.ppt')";
+
+const escapeDriveQueryValue = (val: string) =>
+  val.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
+// Fetch Shared Drives (Team Drives) if the account has any
+export const fetchSharedDrives = async (
+  accessToken: string
+): Promise<SharedDriveInfo[]> => {
+  try {
+    const res = await fetch(
+      "https://www.googleapis.com/drive/v3/drives?pageSize=50",
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.drives || []).map((d: any) => ({ id: d.id, name: d.name }));
+  } catch {
+    return [];
+  }
+};
+
+// Fetch Drive files or folders with pagination (folders first, never silently truncated at 150)
 export const fetchDriveFiles = async (
   accessToken: string,
   folderId: string = "root",
-  searchTerm: string = ""
+  searchTerm: string = "",
+  browseScope: "folder" | "sharedWithMe" = "folder"
 ): Promise<DriveFile[]> => {
   let query = "";
-  
-  if (searchTerm) {
-    // If searching, search globally for files that match mimeTypes OR name
-    query = `trashed = false and (name contains '${searchTerm}') and (mimeType = 'application/vnd.google-apps.folder' or mimeType = 'application/vnd.google-apps.document' or mimeType = 'application/vnd.google-apps.spreadsheet' or mimeType = 'application/vnd.google-apps.presentation' or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or name contains '.hwp' or name contains '.docx' or mimeType = 'application/pdf')`;
+  const trimmedSearch = searchTerm.trim();
+
+  if (trimmedSearch) {
+    const escaped = escapeDriveQueryValue(trimmedSearch);
+    query = `trashed = false and name contains '${escaped}' and ${SUPPORTED_MIME_AND_NAME_FILTER}`;
+  } else if (browseScope === "sharedWithMe") {
+    query = `sharedWithMe = true and trashed = false and ${SUPPORTED_MIME_AND_NAME_FILTER}`;
   } else {
-    // Regular directory listing
-    query = `'${folderId}' in parents and trashed = false and (mimeType = 'application/vnd.google-apps.folder' or mimeType = 'application/vnd.google-apps.document' or mimeType = 'application/vnd.google-apps.spreadsheet' or mimeType = 'application/vnd.google-apps.presentation' or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or name contains '.hwp' or name contains '.docx' or mimeType = 'application/pdf')`;
+    const escapedFolderId = escapeDriveQueryValue(folderId);
+    query = `'${escapedFolderId}' in parents and trashed = false and ${SUPPORTED_MIME_AND_NAME_FILTER}`;
   }
 
-  const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,mimeType,iconLink,size,createdTime,parents)&orderBy=name&pageSize=150`;
+  const allFiles: DriveFile[] = [];
+  let pageToken: string | undefined = undefined;
+  let pageCount = 0;
 
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
+  do {
+    const params = new URLSearchParams({
+      q: query,
+      fields:
+        "nextPageToken,files(id,name,mimeType,iconLink,size,createdTime,parents,shortcutDetails(targetId,targetMimeType))",
+      orderBy: "folder,name",
+      pageSize: "200",
+      supportsAllDrives: "true",
+      includeItemsFromAllDrives: "true",
+    });
+    if (pageToken) {
+      params.set("pageToken", pageToken);
+    }
+
+    const url = `https://www.googleapis.com/drive/v3/files?${params.toString()}`;
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(
+        errData.error?.message || `Failed to fetch files: ${res.status}`
+      );
+    }
+
+    const data = await res.json();
+    if (Array.isArray(data.files)) {
+      allFiles.push(...data.files);
+    }
+    pageToken = data.nextPageToken;
+    pageCount++;
+  } while (pageToken && pageCount < 5);
+
+  const isFolderItem = (f: DriveFile) =>
+    f.mimeType === "application/vnd.google-apps.folder" ||
+    (f.mimeType === "application/vnd.google-apps.shortcut" &&
+      f.shortcutDetails?.targetMimeType === "application/vnd.google-apps.folder");
+
+  // Normalize shortcuts so targetId & targetMimeType work cleanly in navigation & conversion
+  const normalized = allFiles.map((f) => {
+    if (
+      f.mimeType === "application/vnd.google-apps.shortcut" &&
+      f.shortcutDetails?.targetId
+    ) {
+      return {
+        ...f,
+        id: f.shortcutDetails.targetId,
+        mimeType: f.shortcutDetails.targetMimeType || f.mimeType,
+      };
+    }
+    return f;
   });
 
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.error?.message || `Failed to fetch files: ${res.status}`);
-  }
-
-  const data = await res.json();
-  const files: DriveFile[] = data.files || [];
-
-  // Client-side sort: directories first, then files alphabetically
-  return [...files].sort((a, b) => {
-    const aIsFolder = a.mimeType === "application/vnd.google-apps.folder";
-    const bIsFolder = b.mimeType === "application/vnd.google-apps.folder";
+  // Client-side sort: directories first, then files alphabetically (Korean/English natural sort)
+  return normalized.sort((a, b) => {
+    const aIsFolder = isFolderItem(a);
+    const bIsFolder = isFolderItem(b);
     if (aIsFolder && !bIsFolder) return -1;
     if (!aIsFolder && bIsFolder) return 1;
-    return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    return a.name.localeCompare(b.name, "ko", {
+      numeric: true,
+      sensitivity: "base",
+    });
   });
 };
 
 // Fetch folders for parent breadcrumbs
 export const fetchFolderName = async (accessToken: string, folderId: string): Promise<string> => {
   if (folderId === "root") return "내 드라이브";
-  const url = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=name`;
+  const url = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=name&supportsAllDrives=true`;
   const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -189,7 +293,7 @@ export const fetchFolderName = async (accessToken: string, folderId: string): Pr
 
 // Download raw blob from drive
 export const downloadDriveFileBlob = async (accessToken: string, fileId: string): Promise<Blob> => {
-  const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+  const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
   const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -278,7 +382,7 @@ export const deleteDriveFile = async (accessToken: string, fileId: string): Prom
 
 // Rename a file
 export const renameDriveFile = async (accessToken: string, fileId: string, newName: string): Promise<void> => {
-  const url = `https://www.googleapis.com/drive/v3/files/${fileId}`;
+  const url = `https://www.googleapis.com/drive/v3/files/${fileId}?supportsAllDrives=true`;
   const res = await fetch(url, {
     method: "PATCH",
     headers: {
