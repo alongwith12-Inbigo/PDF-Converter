@@ -1,11 +1,11 @@
 {
-  "projectId": "gen-lang-client-0032251033",
-  "appId": "1:764181109927:web:4d510119d94f2f8aac0f82",
-  "apiKey": "AIzaSyBJ4teWL6qVRO381KAspeuvqEHmhIs-scc",
-  "authDomain": "gen-lang-client-0032251033.firebaseapp.com",
-  "storageBucket": "gen-lang-client-0032251033.firebasestorage.app",
-  "messagingSenderId": "764181109927",
+  "projectId": "ibg-pdf",
+  "appId": "1:109379467879:web:be190441a6aeeb2968b2c2",
+  "apiKey": "AIzaSyApr0tJEiWWD0Bdjb2w6SjQVW1ChWY9p7Y",
+  "authDomain": "ibg-pdf.firebaseapp.com",
+  "storageBucket": "ibg-pdf.firebasestorage.app",
+  "messagingSenderId": "109379467879",
   "measurementId": "",
-  "oAuthClientId": "764181109927-3j1ctruabrh405ku2jf8pk3it23qis6p.apps.googleusercontent.com",
+  "oAuthClientId": "109379467879-gcm6lfm3fk28vo225k7sfj8luo098p2o.apps.googleusercontent.com",
   "recaptchaSiteKey": ""
 }
